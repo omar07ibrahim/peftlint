@@ -2,10 +2,12 @@
 
 ## 1. Purpose
 
-This document defines what `peftlint` may conclude from static artifacts. It is
-a contract for the implementation, not a list of aspirational checks.
+This document defines the normative boundary for conclusions that `peftlint`
+may eventually draw from static artifacts. Implemented structural components
+are identified below; rules without their required evaluator remain contract,
+not shipped behavior.
 
-The first release answers two different questions:
+A complete v1 evaluator is intended to answer two different questions:
 
 1. Can this LoRA adapter be loaded onto this exact base-model revision under
    the supported PEFT conventions?
@@ -17,7 +19,19 @@ training data, safety, or task performance.
 
 Ruleset v1 models PEFT 0.19.1. A later or earlier runtime is a different input,
 not a version that this contract assumes is close enough. The normative PEFT
-reference is the immutable [`v0.19.1` tag](https://github.com/huggingface/peft/tree/v0.19.1).
+reference is commit
+[`ba6a190`](https://github.com/huggingface/peft/tree/ba6a19060d6ab54a87538a6e77e3e4d5a907375b),
+which the `v0.19.1` tag resolves to.
+
+| Area | Current status |
+| --- | --- |
+| Config structural evidence | Implemented |
+| Safetensors envelope and storage proof | Implemented |
+| Rule-result reducer | Implemented |
+| Config-to-PL004 evaluator | Not implemented |
+| Inventory and base-model reconciliation | Not implemented |
+| Hotswap evaluation | Not implemented |
+| Canonical report serialization | Not implemented |
 
 ## 2. Inputs
 
@@ -45,8 +59,8 @@ dimension rule cannot run until the relevant shard headers have been inspected.
 
 ### Runtime evidence
 
-Hotswap checks target PEFT 0.19.1 and a named `peftlint` runtime profile. The
-input includes a preparation manifest with:
+A complete hotswap check targets PEFT 0.19.1 and a named `peftlint` runtime
+profile. Its input will include a preparation manifest with:
 
 - the reference adapter identity;
 - normalized target paths and layer kinds;
@@ -54,9 +68,9 @@ input includes a preparation manifest with:
 - whether the model was compiled;
 - the preparation entry point and options used before hotswapping.
 
-An absent, unsupported, or unmodeled runtime or preparation field makes hotswap
-compatibility unknown. Every hotswap report includes the full runtime identity
-and preparation-manifest digest.
+An absent, unsupported, or unmodeled runtime or preparation field must make
+hotswap compatibility unknown. Every future hotswap report must include the
+full runtime identity and preparation-manifest digest.
 
 The scanner must not import repository code. A model requiring custom code is
 not rejected solely for that reason, but rules that depend on its runtime
@@ -65,11 +79,14 @@ module semantics return `unknown`.
 ## 3. Trust and resource boundaries
 
 Static analysis is useful only if inspecting an artifact is cheaper and safer
-than loading it.
+than loading it. Shipped component parsers enforce the in-memory boundaries
+that apply to them; future source adapters and evaluators must preserve the
+remaining boundaries in this section.
 
 - JSON inputs have explicit byte and nesting limits.
 - The safetensors header length is validated before the header is read.
-- Duplicate JSON object keys are rejected before ordinary object decoding.
+- Duplicate JSON object keys are rejected during bounded decoding, before a
+  manifest is accepted.
 - Tensor spans are sorted numerically for validation; JSON member order has no
   storage meaning.
 - Tensor data offsets must be contiguous, non-overlapping, and within file
@@ -81,8 +98,10 @@ than loading it.
   as unsupported serialization.
 - Symbolic links and paths outside a local audit root are not followed.
 
-An exhausted resource limit is an `unknown` result with a finding. It is not a
-pass and not automatically evidence that the adapter is malformed.
+Component parsers raise a classified limit exception when a resource budget is
+exhausted. A future evaluator must translate that condition into `unknown` with
+a finding; it is not a pass and not automatically evidence that the adapter is
+malformed.
 
 ## 4. Verdict model
 
@@ -106,7 +125,7 @@ unknown rule makes the profile unknown. Warnings never upgrade a verdict.
 
 ## 5. Rule result shape
 
-Every rule result contains:
+Every emitted rule result must contain:
 
 - stable rule identifier and ruleset version;
 - severity and compatibility profile;
@@ -115,11 +134,11 @@ Every rule result contains:
 - observed and expected values when both are safe to record;
 - whether the rule passed, contradicted the contract, or could not run.
 
-Ordering is deterministic: profile, rule identifier, artifact, logical path.
-Evidence uses the JSON Canonicalization Scheme in
-[RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785). The same immutable
-inputs, runtime profile, limits, and ruleset must produce byte-equivalent
-canonical evidence.
+Ordering must be deterministic: profile, rule identifier, artifact, logical
+path. The report serializer must use the JSON Canonicalization Scheme in
+[RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785). Until that serializer
+is implemented and tested, `peftlint` does not claim byte-equivalent canonical
+reports.
 
 ## 6. Supported configuration profile
 
@@ -131,12 +150,16 @@ indices, Megatron integration, or unmodeled adapter variant.
 
 Fields such as rank, alpha, dropout, task type, target selection, and
 `modules_to_save` are allowed only when the rules below fully interpret them.
-Initialization-only fields may be recorded as non-structural after their PEFT
-0.19.1 meaning is classified.
+The current config parser recognizes special initializers and retains their
+normalized kind, but every non-default initializer blocks configuration
+closure until later rules model it.
 
 A versioned schema must recognize every config key. Any unknown key or
 unsupported non-default value makes the affected profile unknown. This gate is
 what prevents a newer PEFT option from being silently treated as ordinary LoRA.
+The shipped [adapter configuration parser](adapter-config-parser.md) implements
+the structural classification for this gate; `closed_profile` is evidence for
+a future PL004 evaluator, not a load verdict by itself.
 
 ## 7. Mandatory load rules
 
@@ -163,6 +186,10 @@ Every config key is classified by the `peft-0.19.1-lora-v1` schema, and every
 topology- or state-affecting value is supported. An unknown key, an unsupported
 non-default value, or a missing value whose PEFT 0.19.1 default cannot be
 established makes the load verdict unknown.
+
+The current config parser supplies the field classification and normalized
+profile. The PL004 evaluator that converts that evidence into a rule result and
+load verdict is not yet implemented.
 
 ### PL010 — base identity
 
@@ -267,18 +294,18 @@ check and may remain unknown.
 
 ## 8. Mandatory hotswap rules
 
-Hotswap compatibility compares a candidate with a reference adapter and the
-prepared base topology. Both load verdicts must be compatible. An incompatible
-load verdict makes hotswap incompatible; otherwise, an unknown load verdict
-makes hotswap unknown before hotswap-specific rules are considered.
+A future hotswap evaluator must compare a candidate with a reference adapter
+and the prepared base topology. Both load verdicts must be compatible. An
+incompatible load verdict makes hotswap incompatible; otherwise, an unknown
+load verdict makes hotswap unknown before hotswap-specific rules are considered.
 
 ### PL200 — method compatibility
 
-This rule reproduces PEFT 0.19.1's `check_hotswap_configs_compatible` gate. Both
-adapters have the same `peft_type` and equal values for `use_rslora`,
-`lora_dropout`, `alpha_pattern`, and `use_dora`. A known mismatch is
-incompatible. A missing or unmodeled comparison value is unknown rather than
-filled from a different PEFT release.
+The PL200 evaluator must reproduce PEFT 0.19.1's
+`check_hotswap_configs_compatible` gate. Both adapters must have the same
+`peft_type` and equal values for `use_rslora`, `lora_dropout`, `alpha_pattern`,
+and `use_dora`. A known mismatch is incompatible. A missing or unmodeled
+comparison value is unknown rather than filled from a different PEFT release.
 
 ### PL201 — runtime profile
 
@@ -322,9 +349,9 @@ Support for one architecture does not generalize by naming resemblance. New
 architecture mappings and PEFT variants require fixtures that demonstrate both
 valid artifacts and minimal counterexamples.
 
-## 10. Evidence required before a compatible verdict ships
+## 10. Evidence required before a non-unknown verdict ships
 
-The implementation may expose a rule only after tests cover:
+An evaluator may emit a non-unknown result for a rule only after tests cover:
 
 1. a valid minimal fixture;
 2. a single-fault fixture that the rule rejects;

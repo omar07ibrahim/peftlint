@@ -10,12 +10,21 @@ object and for distinguishing transport failures from malformed artifacts.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import NoReturn, cast
+
+from peftlint._bounded_json import (
+    BoundedJsonError,
+    BoundedJsonErrorCode,
+    IntegerLexeme,
+    InvalidJson,
+    JsonLimitExceeded,
+    JsonLimits,
+    decode_json,
+)
 
 SAFETENSORS_HEADER_LIMIT = 100_000_000
 """Maximum header length accepted by the pinned safetensors v0.8 format."""
@@ -703,16 +712,6 @@ class SafetensorsManifest:
         raise TypeError(f"{type(self).__name__} is immutable")
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class _IntegerLexeme:
-    value: str
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class _FloatLexeme:
-    value: str
-
-
 def _validated_limits_copy(limits: SafetensorsLimits) -> SafetensorsLimits:
     return SafetensorsLimits(
         max_header_bytes=limits.max_header_bytes,
@@ -846,8 +845,22 @@ def decode_header(envelope: HeaderEnvelope) -> DecodedSafetensorsHeader:
     if text is None:
         raise InvalidSafetensors(SafetensorsErrorCode.HEADER_UTF8)
 
-    _prescan_json(text, limits)
-    root = _load_json(text, limits)
+    json_error: BoundedJsonError | None = None
+    root: object | None = None
+    try:
+        root = decode_json(
+            text,
+            JsonLimits(
+                max_document_chars=limits.max_header_bytes,
+                max_depth=limits.max_json_depth,
+                max_string_chars=limits.max_json_string_chars,
+                max_tokens=limits.max_json_tokens,
+            ),
+        )
+    except BoundedJsonError as error:
+        json_error = error
+    if json_error is not None:
+        _raise_safetensors_json_error(json_error)
     if type(root) is not dict:
         raise InvalidSafetensors(SafetensorsErrorCode.HEADER_NOT_OBJECT)
     members = cast(dict[str, object], root)
@@ -992,106 +1005,33 @@ def _manifest_storage_key(tensor: TensorManifest) -> tuple[int, int, str]:
     return begin, end, tensor.name
 
 
-def _prescan_json(text: str, limits: SafetensorsLimits) -> None:
-    depth = 0
-    tokens = 0
-    in_string = False
-    in_primitive = False
-    escaped = False
-    string_chars = 0
+def _raise_safetensors_json_error(error: BoundedJsonError) -> NoReturn:
+    if type(error) is InvalidJson:
+        code = (
+            SafetensorsErrorCode.DUPLICATE_JSON_KEY
+            if error.code is BoundedJsonErrorCode.DUPLICATE_KEY
+            else SafetensorsErrorCode.HEADER_JSON
+        )
+        raise InvalidSafetensors(code)
 
-    def count_token() -> None:
-        nonlocal tokens
-        tokens += 1
-        if tokens > limits.max_json_tokens:
-            raise SafetensorsLimitExceeded(
-                SafetensorsErrorCode.JSON_TOKEN_EXCEEDS_POLICY_LIMIT,
-                limit=limits.max_json_tokens,
-            )
-
-    for character in text:
-        if in_string:
-            if character == '"' and not escaped:
-                in_string = False
-                continue
-            string_chars += 1
-            if string_chars > limits.max_json_string_chars:
-                raise SafetensorsLimitExceeded(
-                    SafetensorsErrorCode.JSON_STRING_EXCEEDS_POLICY_LIMIT,
-                    limit=limits.max_json_string_chars,
-                )
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            continue
-
-        if character == '"':
-            count_token()
-            in_string = True
-            in_primitive = False
-            string_chars = 0
-        elif character in "[{":
-            count_token()
-            depth += 1
-            in_primitive = False
-            if depth > limits.max_json_depth:
-                raise SafetensorsLimitExceeded(
-                    SafetensorsErrorCode.JSON_DEPTH_EXCEEDS_POLICY_LIMIT,
-                    limit=limits.max_json_depth,
-                )
-        elif character in "]}":
-            depth = max(0, depth - 1)
-            in_primitive = False
-        elif character == ",":
-            count_token()
-            in_primitive = False
-        elif character == ":" or character in " \t\r\n":
-            in_primitive = False
-        elif not in_primitive:
-            count_token()
-            in_primitive = True
-
-
-def _load_json(text: str, limits: SafetensorsLimits) -> object:
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise InvalidSafetensors(SafetensorsErrorCode.DUPLICATE_JSON_KEY)
-            result[key] = value
-        return result
-
-    def reject_constant(_value: str) -> NoReturn:
-        raise InvalidSafetensors(SafetensorsErrorCode.HEADER_JSON)
-
-    result: object | None = None
-    json_failed = False
-    recursion_failed = False
-    try:
-        result = cast(
-            object,
-            json.loads(
-                text,
-                object_pairs_hook=unique_object,
-                parse_int=_IntegerLexeme,
-                parse_float=_FloatLexeme,
-                parse_constant=reject_constant,
+    if type(error) is JsonLimitExceeded:
+        limit_code = {
+            BoundedJsonErrorCode.DOCUMENT_LIMIT: (SafetensorsErrorCode.HEADER_EXCEEDS_POLICY_LIMIT),
+            BoundedJsonErrorCode.DEPTH_LIMIT: (
+                SafetensorsErrorCode.JSON_DEPTH_EXCEEDS_POLICY_LIMIT
             ),
-        )
-    except json.JSONDecodeError:
-        json_failed = True
-    except RecursionError:
-        recursion_failed = True
+            BoundedJsonErrorCode.STRING_LIMIT: (
+                SafetensorsErrorCode.JSON_STRING_EXCEEDS_POLICY_LIMIT
+            ),
+            BoundedJsonErrorCode.TOKEN_LIMIT: (
+                SafetensorsErrorCode.JSON_TOKEN_EXCEEDS_POLICY_LIMIT
+            ),
+        }.get(error.code)
+        if limit_code is None:
+            raise ValueError("unsupported bounded JSON limit code")
+        raise SafetensorsLimitExceeded(limit_code, limit=error.limit)
 
-    if json_failed:
-        raise InvalidSafetensors(SafetensorsErrorCode.HEADER_JSON)
-    if recursion_failed:
-        raise SafetensorsLimitExceeded(
-            SafetensorsErrorCode.JSON_DEPTH_EXCEEDS_POLICY_LIMIT,
-            limit=limits.max_json_depth,
-        )
-    return result
+    raise TypeError("unsupported bounded JSON error type")
 
 
 def _decode_metadata(
@@ -1168,7 +1108,7 @@ def _decode_unsigned_sequence(value: object) -> tuple[int, ...]:
 
 
 def _decode_u64(value: object) -> int:
-    if type(value) is not _IntegerLexeme:
+    if type(value) is not IntegerLexeme:
         raise InvalidSafetensors(SafetensorsErrorCode.INVALID_TENSOR_FIELD)
     digits = value.value
     maximum = "18446744073709551615"

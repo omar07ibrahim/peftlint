@@ -1,6 +1,6 @@
 # peftlint
 
-Static compatibility checks for LoRA adapters, without importing model code
+Static compatibility evidence for LoRA adapters, without importing model code
 or allocating model tensors.
 
 A PEFT adapter is small enough to move casually, but it is not self-contained.
@@ -8,18 +8,43 @@ It depends on a particular base model topology, vocabulary, set of target
 modules, and often an unspecified revision. A mismatch may remain invisible
 until a large base model has been loaded.
 
-`peftlint` moves those failures into a bounded preflight step. Its first shipped
-component validates a safetensors manifest without opening the tensor payload.
-The broader scanner will reconcile that manifest with the adapter configuration
-and a pinned base-model manifest before inference or deployment begins.
+`peftlint` moves those failures into a bounded preflight step. It currently
+ships pure parsers for PEFT 0.19.1 `adapter_config.json` documents and
+safetensors v0.8 manifests. The broader scanner will reconcile both forms of
+evidence with a pinned base-model manifest before inference or deployment.
 
 ## What works today
 
-The package exposes a pure, four-stage safetensors v0.8 inspection pipeline. It
-plans a bounded header read, accepts only a byte string of the planned length,
-decodes the header under explicit JSON limits, and proves dtype, shape, span,
-and payload-coverage invariants. It does not import model code or allocate
-tensor storage.
+### Adapter configuration
+
+The configuration parser accepts bytes, enforces explicit UTF-8 and JSON
+budgets, rejects duplicate keys, expands pinned PEFT defaults, and classifies
+all 39 recognized base and LoRA fields without importing PEFT.
+
+```python
+from peftlint import parse_adapter_config
+
+manifest = parse_adapter_config(
+    b'{"peft_type":"LORA","r":16,'
+    b'"target_modules":["q_proj","v_proj"]}'
+)
+
+assert manifest.closed_profile
+assert manifest.lora is not None
+assert manifest.lora.r == 16
+```
+
+`closed_profile` means only that the document fits the modeled ordinary-LoRA
+configuration schema. It is not a load, safety, or compatibility verdict. See
+[Adapter configuration inspection](https://github.com/omar07ibrahim/peftlint/blob/main/docs/adapter-config-parser.md)
+for limits, normalization rules, failure classes, and non-goals.
+
+### Safetensors manifest
+
+The safetensors parser exposes a pure four-stage inspection pipeline. It plans
+a bounded header read, accepts only the planned byte count, decodes the header
+under explicit JSON limits, and proves dtype, shape, span, and payload-coverage
+invariants. It never opens the tensor payload or allocates tensor storage.
 
 ```python
 import json
@@ -69,9 +94,10 @@ Each verdict has three possible states:
 - **unknown** — the artifact needs runtime validation that static evidence
   cannot justify.
 
-Custom model code, unfamiliar tensor naming, fused projections, unsupported
-configuration features, and unclassified tensors produce `unknown`, never a
-convenient false pass.
+The ruleset requires custom model code, unfamiliar tensor naming, fused
+projections, unsupported configuration features, and unclassified tensors to
+produce `unknown`, never a convenient false pass, once the end-to-end evaluator
+is implemented.
 
 End-to-end LoRA compatibility evaluation is still under active development.
 The current

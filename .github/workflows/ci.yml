@@ -71,9 +71,15 @@ jobs:
         run: python -m pytest -q
 
   wheel:
-    name: Wheel / clean install
+    name: Wheel / Python ${{ matrix.python-version }} / clean install
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.14"
     steps:
       - name: Check out the repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -82,7 +88,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Build the wheel
@@ -92,10 +98,24 @@ jobs:
           python -m venv "$RUNNER_TEMP/peftlint-smoke"
           "$RUNNER_TEMP/peftlint-smoke/bin/pip" install \
             --no-index --find-links dist peftlint
-      - name: Check installed metadata and typing marker
+      - name: Check installed dependencies
+        run: |
+          "$RUNNER_TEMP/peftlint-smoke/bin/python" -m pip check
+      - name: Check installed metadata, typing marker, and public API
         working-directory: ${{ runner.temp }}
         run: >-
           "$RUNNER_TEMP/peftlint-smoke/bin/python" -I -c
-          "import importlib.metadata, importlib.resources, peftlint;
+          "import importlib.metadata, importlib.resources, inspect, peftlint;
+          from peftlint import adapter_config;
           assert peftlint.__version__ == importlib.metadata.version('peftlint');
-          assert importlib.resources.files('peftlint').joinpath('py.typed').is_file()"
+          package_root = importlib.resources.files('peftlint');
+          assert package_root.joinpath('py.typed').is_file();
+          assert package_root.joinpath('adapter_config.py').is_file();
+          assert set(adapter_config.__all__) <= set(peftlint.__all__);
+          signature = inspect.signature(peftlint.parse_adapter_config);
+          assert tuple(signature.parameters) == ('document', 'limits');
+          manifest = peftlint.parse_adapter_config(b'{\"peft_type\":\"LORA\"}');
+          assert type(manifest) is peftlint.AdapterConfigManifest;
+          assert manifest.method_status is peftlint.AdapterMethodStatus.SUPPORTED_LORA;
+          assert type(manifest.lora) is peftlint.LoraConfigProfile;
+          assert manifest.closed_profile"
