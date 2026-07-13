@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
+from typing import get_type_hints
 
 import pytest
 
-from peftlint._bounded_json import BoundedJsonError, BoundedJsonErrorCode
-from peftlint.adapter_config import (
+import peftlint
+import peftlint.adapter_config as adapter_config_module
+from peftlint import (
     ADAPTER_CONFIG_SCHEMA,
     DEFAULT_ADAPTER_CONFIG_LIMITS,
     PINNED_PEFT_VERSION,
@@ -30,11 +33,37 @@ from peftlint.adapter_config import (
     ModuleSelectorKind,
     PeftTaskType,
     RankPatternEntry,
-    _add_issue,
-    _raise_adapter_json_error,
     parse_adapter_config,
 )
+from peftlint._bounded_json import BoundedJsonError, BoundedJsonErrorCode
+from peftlint.adapter_config import _add_issue, _raise_adapter_json_error
 from peftlint.evidence import LORA_V1_RULESET
+
+PUBLIC_ADAPTER_CONFIG_API = (
+    "ADAPTER_CONFIG_SCHEMA",
+    "DEFAULT_ADAPTER_CONFIG_LIMITS",
+    "PINNED_PEFT_VERSION",
+    "AdapterConfigErrorCode",
+    "AdapterConfigInspectionError",
+    "AdapterConfigLimitExceeded",
+    "AdapterConfigLimits",
+    "AdapterConfigManifest",
+    "AdapterMethodStatus",
+    "AlphaPatternEntry",
+    "AutoMapping",
+    "ConfigFieldIssue",
+    "ConfigFieldIssueKind",
+    "InvalidAdapterConfig",
+    "LoraBiasMode",
+    "LoraConfigProfile",
+    "LoraInitializer",
+    "LoraInitializerKind",
+    "ModuleSelector",
+    "ModuleSelectorKind",
+    "PeftTaskType",
+    "RankPatternEntry",
+    "parse_adapter_config",
+)
 
 
 def encode_config(config: object) -> bytes:
@@ -99,6 +128,38 @@ FULL_DEFAULT_CONFIG: dict[str, object] = {
     "arrow_config": None,
     "ensure_weight_tying": False,
 }
+
+
+def test_package_root_exports_the_complete_adapter_config_api() -> None:
+    assert tuple(adapter_config_module.__all__) == PUBLIC_ADAPTER_CONFIG_API
+    assert set(PUBLIC_ADAPTER_CONFIG_API) <= set(peftlint.__all__)
+    for name in PUBLIC_ADAPTER_CONFIG_API:
+        assert getattr(peftlint, name) is getattr(adapter_config_module, name)
+
+    manifest = peftlint.parse_adapter_config(b'{"peft_type":"LORA"}')
+
+    assert type(manifest) is peftlint.AdapterConfigManifest
+    assert manifest.method_status is peftlint.AdapterMethodStatus.SUPPORTED_LORA
+    assert type(manifest.lora) is peftlint.LoraConfigProfile
+    assert manifest.closed_profile
+
+
+def test_public_parser_signature_preserves_the_pure_bytes_boundary() -> None:
+    signature = inspect.signature(parse_adapter_config)
+    parameters = signature.parameters
+    hints = get_type_hints(parse_adapter_config)
+
+    assert tuple(parameters) == ("document", "limits")
+    assert parameters["document"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert parameters["document"].default is inspect.Parameter.empty
+    assert parameters["limits"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["limits"].default is DEFAULT_ADAPTER_CONFIG_LIMITS
+    assert hints["document"] is bytes
+    assert hints["limits"] is AdapterConfigLimits
+    assert hints["return"] is AdapterConfigManifest
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'path'"):
+        parse_adapter_config(b"{}", path=object())  # type: ignore[call-arg]
 
 
 def test_minimal_lora_config_expands_pinned_defaults() -> None:
