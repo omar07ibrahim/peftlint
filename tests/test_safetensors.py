@@ -1169,6 +1169,17 @@ def test_decode_header_requires_an_envelope() -> None:
         decode_header(object())  # type: ignore[arg-type]
 
 
+def test_decode_header_revalidates_the_envelope_current_state() -> None:
+    plan = plan_header_read(bytes(8), file_size=8)
+    envelope = accept_header(plan, b"")
+    object.__setattr__(envelope, "header", b"{}")
+
+    with pytest.raises(SafetensorsReadMismatch) as raised:
+        decode_header(envelope)
+
+    assert raised.value.code is SafetensorsErrorCode.HEADER_LENGTH_MISMATCH
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

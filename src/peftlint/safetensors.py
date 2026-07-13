@@ -11,8 +11,10 @@ object and for distinguishing transport failures from malformed artifacts.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import NoReturn, cast
 
 SAFETENSORS_HEADER_LIMIT = 100_000_000
@@ -47,6 +49,14 @@ class SafetensorsErrorCode(StrEnum):
     INVALID_TENSOR_FIELD = "invalid_tensor_field"
     INTEGER_OUT_OF_RANGE = "integer_out_of_range"
     TENSOR_RANK_EXCEEDS_POLICY_LIMIT = "tensor_rank_exceeds_policy_limit"
+    INVALID_DTYPE = "invalid_dtype"
+    TENSOR_SIZE_OVERFLOW = "tensor_size_overflow"
+    TENSOR_BYTE_MISALIGNED = "tensor_byte_misaligned"
+    TENSOR_OFFSETS_REVERSED = "tensor_offsets_reversed"
+    TENSOR_LAYOUT_GAP = "tensor_layout_gap"
+    TENSOR_LAYOUT_OVERLAP = "tensor_layout_overlap"
+    TENSOR_SIZE_MISMATCH = "tensor_size_mismatch"
+    PAYLOAD_SIZE_MISMATCH = "payload_size_mismatch"
 
 
 _ERROR_MESSAGES = {
@@ -103,7 +113,35 @@ _ERROR_MESSAGES = {
     SafetensorsErrorCode.TENSOR_RANK_EXCEEDS_POLICY_LIMIT: (
         "safetensors header exceeds the tensor rank limit"
     ),
+    SafetensorsErrorCode.INVALID_DTYPE: "safetensors tensor uses an invalid dtype",
+    SafetensorsErrorCode.TENSOR_SIZE_OVERFLOW: (
+        "safetensors tensor size exceeds unsigned 64-bit arithmetic"
+    ),
+    SafetensorsErrorCode.TENSOR_BYTE_MISALIGNED: (
+        "safetensors sub-byte tensor does not end on a byte boundary"
+    ),
+    SafetensorsErrorCode.TENSOR_OFFSETS_REVERSED: ("safetensors tensor offsets are reversed"),
+    SafetensorsErrorCode.TENSOR_LAYOUT_GAP: "safetensors tensor layout contains a gap",
+    SafetensorsErrorCode.TENSOR_LAYOUT_OVERLAP: ("safetensors tensor layout contains an overlap"),
+    SafetensorsErrorCode.TENSOR_SIZE_MISMATCH: (
+        "safetensors tensor span does not match its dtype and shape"
+    ),
+    SafetensorsErrorCode.PAYLOAD_SIZE_MISMATCH: (
+        "safetensors tensor layout does not cover the declared payload"
+    ),
 }
+
+_PL101_ERROR_CODES = frozenset(
+    {
+        SafetensorsErrorCode.TENSOR_SIZE_OVERFLOW,
+        SafetensorsErrorCode.TENSOR_BYTE_MISALIGNED,
+        SafetensorsErrorCode.TENSOR_OFFSETS_REVERSED,
+        SafetensorsErrorCode.TENSOR_LAYOUT_GAP,
+        SafetensorsErrorCode.TENSOR_LAYOUT_OVERLAP,
+        SafetensorsErrorCode.TENSOR_SIZE_MISMATCH,
+        SafetensorsErrorCode.PAYLOAD_SIZE_MISMATCH,
+    }
+)
 
 _INVALID_ERROR_CODES = frozenset(
     {
@@ -120,6 +158,8 @@ _INVALID_ERROR_CODES = frozenset(
         SafetensorsErrorCode.MISSING_TENSOR_FIELD,
         SafetensorsErrorCode.INVALID_TENSOR_FIELD,
         SafetensorsErrorCode.INTEGER_OUT_OF_RANGE,
+        SafetensorsErrorCode.INVALID_DTYPE,
+        *_PL101_ERROR_CODES,
     }
 )
 _READ_MISMATCH_ERROR_CODES = frozenset(
@@ -159,8 +199,11 @@ class SafetensorsInspectionError(Exception):
 class InvalidSafetensors(SafetensorsInspectionError):
     """The supplied evidence contradicts the safetensors envelope format."""
 
+    rule_id: str
+
     def __init__(self, code: SafetensorsErrorCode) -> None:
         _require_error_category(code, _INVALID_ERROR_CODES, "invalid safetensors")
+        self.rule_id = "PL101" if code in _PL101_ERROR_CODES else "PL100"
         super().__init__(code)
 
 
@@ -236,6 +279,11 @@ class SafetensorsLimits:
             if value < 0:
                 raise ValueError(f"{name} must not be negative")
 
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could bypass validation."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
+
 
 DEFAULT_SAFETENSORS_LIMITS = SafetensorsLimits()
 
@@ -263,6 +311,7 @@ class HeaderReadPlan:
             raise TypeError("header read plan sizes must be integers")
         if type(self.limits) is not SafetensorsLimits:
             raise TypeError("header read plan limits must be SafetensorsLimits")
+        object.__setattr__(self, "limits", _validated_limits_copy(self.limits))
         if self.file_size < 8:
             raise ValueError("header read plan file_size must be at least 8")
         if not 0 <= self.header_size <= self.limits.max_header_bytes:
@@ -273,6 +322,11 @@ class HeaderReadPlan:
             raise ValueError("header read plan data_offset is inconsistent")
         if self.data_size < 0 or self.data_size != self.file_size - self.data_offset:
             raise ValueError("header read plan data_size is inconsistent")
+
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could bypass validation."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,8 +345,14 @@ class HeaderEnvelope:
             raise TypeError("plan must be HeaderReadPlan")
         if type(self.header) is not bytes:
             raise TypeError("header must be bytes")
+        object.__setattr__(self, "plan", _validated_plan_copy(self.plan))
         if len(self.header) != self.plan.header_size:
             raise SafetensorsReadMismatch(SafetensorsErrorCode.HEADER_LENGTH_MISMATCH)
+
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could bypass validation."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
 
 
 class MetadataForm(StrEnum):
@@ -310,6 +370,109 @@ class HeaderNotice(StrEnum):
     UNKNOWN_TENSOR_FIELDS = "unknown_tensor_fields"
 
 
+class SafetensorsDtype(StrEnum):
+    """The exact dtype tokens understood by safetensors v0.8."""
+
+    F4 = "F4"
+    F6_E2M3 = "F6_E2M3"
+    F6_E3M2 = "F6_E3M2"
+    BOOL = "BOOL"
+    U8 = "U8"
+    I8 = "I8"
+    F8_E5M2 = "F8_E5M2"
+    F8_E4M3 = "F8_E4M3"
+    F8_E8M0 = "F8_E8M0"
+    F8_E4M3FNUZ = "F8_E4M3FNUZ"
+    F8_E5M2FNUZ = "F8_E5M2FNUZ"
+    I16 = "I16"
+    U16 = "U16"
+    F16 = "F16"
+    BF16 = "BF16"
+    I32 = "I32"
+    U32 = "U32"
+    F32 = "F32"
+    C64 = "C64"
+    F64 = "F64"
+    I64 = "I64"
+    U64 = "U64"
+
+    @property
+    def bits_per_element(self) -> int:
+        """Return the v0.8 storage width for one logical element."""
+
+        return _DTYPE_BITS[self]
+
+
+_DTYPE_BITS: Mapping[SafetensorsDtype, int] = MappingProxyType(
+    {
+        SafetensorsDtype.F4: 4,
+        SafetensorsDtype.F6_E2M3: 6,
+        SafetensorsDtype.F6_E3M2: 6,
+        SafetensorsDtype.BOOL: 8,
+        SafetensorsDtype.U8: 8,
+        SafetensorsDtype.I8: 8,
+        SafetensorsDtype.F8_E5M2: 8,
+        SafetensorsDtype.F8_E4M3: 8,
+        SafetensorsDtype.F8_E8M0: 8,
+        SafetensorsDtype.F8_E4M3FNUZ: 8,
+        SafetensorsDtype.F8_E5M2FNUZ: 8,
+        SafetensorsDtype.I16: 16,
+        SafetensorsDtype.U16: 16,
+        SafetensorsDtype.F16: 16,
+        SafetensorsDtype.BF16: 16,
+        SafetensorsDtype.I32: 32,
+        SafetensorsDtype.U32: 32,
+        SafetensorsDtype.F32: 32,
+        SafetensorsDtype.C64: 64,
+        SafetensorsDtype.F64: 64,
+        SafetensorsDtype.I64: 64,
+        SafetensorsDtype.U64: 64,
+    }
+)
+
+
+def _has_lone_surrogate(value: str) -> bool:
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
+def _validate_tensor_components(
+    *,
+    name: object,
+    dtype: object,
+    shape: object,
+    data_offsets: object,
+    unknown_fields: object,
+) -> None:
+    if type(name) is not str or type(dtype) is not str:
+        raise TypeError("tensor name and dtype must be strings")
+    if _has_lone_surrogate(name) or _has_lone_surrogate(dtype):
+        raise ValueError("tensor name and dtype must contain valid Unicode scalars")
+    if name == "__metadata__":
+        raise ValueError("__metadata__ is reserved and cannot be a tensor name")
+    if type(shape) is not tuple or not all(type(size) is int for size in shape):
+        raise TypeError("tensor shape must be a tuple of integers")
+    if any(not 0 <= size <= _U64_MAX for size in shape):
+        raise ValueError("tensor shape integers must fit unsigned 64-bit values")
+    if (
+        type(data_offsets) is not tuple
+        or len(data_offsets) != 2
+        or not all(type(offset) is int for offset in data_offsets)
+    ):
+        raise TypeError("tensor data_offsets must contain exactly two integers")
+    if any(not 0 <= offset <= _U64_MAX for offset in data_offsets):
+        raise ValueError("tensor offsets must fit unsigned 64-bit values")
+    if type(unknown_fields) is not tuple or not all(
+        type(field_name) is str for field_name in unknown_fields
+    ):
+        raise TypeError("unknown_fields must be a tuple of strings")
+    if any(_has_lone_surrogate(field_name) for field_name in unknown_fields):
+        raise ValueError("unknown field names must contain valid Unicode scalars")
+    if unknown_fields != tuple(sorted(set(unknown_fields))):
+        raise ValueError("unknown field names must be sorted and unique")
+    if frozenset(unknown_fields) & {"dtype", "shape", "data_offsets"}:
+        raise ValueError("required tensor fields cannot be unknown fields")
+
+
 @dataclass(frozen=True, slots=True)
 class TensorHeader:
     """One schema-decoded tensor entry whose storage is not yet validated."""
@@ -321,34 +484,18 @@ class TensorHeader:
     unknown_fields: tuple[str, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
-        if type(self.name) is not str or type(self.dtype) is not str:
-            raise TypeError("tensor name and dtype must be strings")
-        if _has_lone_surrogate(self.name) or _has_lone_surrogate(self.dtype):
-            raise ValueError("tensor name and dtype must contain valid Unicode scalars")
-        if self.name == "__metadata__":
-            raise ValueError("__metadata__ is reserved and cannot be a tensor name")
-        if type(self.shape) is not tuple or not all(type(size) is int for size in self.shape):
-            raise TypeError("tensor shape must be a tuple of integers")
-        if any(not 0 <= size <= _U64_MAX for size in self.shape):
-            raise ValueError("tensor shape integers must fit unsigned 64-bit values")
-        if (
-            type(self.data_offsets) is not tuple
-            or len(self.data_offsets) != 2
-            or not all(type(offset) is int for offset in self.data_offsets)
-        ):
-            raise TypeError("tensor data_offsets must contain exactly two integers")
-        if any(not 0 <= offset <= _U64_MAX for offset in self.data_offsets):
-            raise ValueError("tensor offsets must fit unsigned 64-bit values")
-        if type(self.unknown_fields) is not tuple or not all(
-            type(name) is str for name in self.unknown_fields
-        ):
-            raise TypeError("unknown_fields must be a tuple of strings")
-        if any(_has_lone_surrogate(name) for name in self.unknown_fields):
-            raise ValueError("unknown field names must contain valid Unicode scalars")
-        if self.unknown_fields != tuple(sorted(set(self.unknown_fields))):
-            raise ValueError("unknown field names must be sorted and unique")
-        if frozenset(self.unknown_fields) & {"dtype", "shape", "data_offsets"}:
-            raise ValueError("required tensor fields cannot be unknown fields")
+        _validate_tensor_components(
+            name=self.name,
+            dtype=self.dtype,
+            shape=self.shape,
+            data_offsets=self.data_offsets,
+            unknown_fields=self.unknown_fields,
+        )
+
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could bypass validation."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +515,12 @@ class DecodedSafetensorsHeader:
             type(tensor) is TensorHeader for tensor in self.tensors
         ):
             raise TypeError("decoded header tensors must be a tuple of TensorHeader values")
+        object.__setattr__(self, "plan", _validated_plan_copy(self.plan))
+        object.__setattr__(
+            self,
+            "tensors",
+            tuple(_validated_tensor_header_copy(tensor) for tensor in self.tensors),
+        )
         tensor_names = tuple(tensor.name for tensor in self.tensors)
         if tensor_names != tuple(sorted(set(tensor_names))):
             raise ValueError("decoded header tensor names must be sorted and unique")
@@ -415,6 +568,140 @@ class DecodedSafetensorsHeader:
         if frozenset(self.notices) != expected_notices:
             raise ValueError("decoded header notices are inconsistent")
 
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could bypass validation."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
+
+
+@dataclass(frozen=True, slots=True)
+class TensorManifest:
+    """One tensor with a dtype-, shape-, and span-consistent byte range."""
+
+    name: str = field(repr=False)
+    dtype: SafetensorsDtype
+    shape: tuple[int, ...]
+    data_offsets: tuple[int, int]
+    unknown_fields: tuple[str, ...] = field(default=(), repr=False)
+    _element_count: int = field(init=False, repr=False)
+    _nbytes: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.dtype) is not SafetensorsDtype:
+            raise TypeError("tensor manifest dtype must be SafetensorsDtype")
+        _validate_tensor_components(
+            name=self.name,
+            dtype=self.dtype.value,
+            shape=self.shape,
+            data_offsets=self.data_offsets,
+            unknown_fields=self.unknown_fields,
+        )
+        begin, end = self.data_offsets
+        if end < begin:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_OFFSETS_REVERSED)
+        element_count, expected_bytes = _checked_tensor_size(self.shape, self.dtype)
+        if end - begin != expected_bytes:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_SIZE_MISMATCH)
+        object.__setattr__(self, "_element_count", element_count)
+        object.__setattr__(self, "_nbytes", expected_bytes)
+
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could forge derived values."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
+
+    @property
+    def element_count(self) -> int:
+        """Return the checked ordered product of the declared shape."""
+
+        return self._element_count
+
+    @property
+    def nbytes(self) -> int:
+        """Return the exact byte width proved for this tensor."""
+
+        return self._nbytes
+
+
+@dataclass(frozen=True, slots=True)
+class SafetensorsManifest:
+    """A schema- and storage-validated safetensors v0.8 manifest."""
+
+    plan: HeaderReadPlan
+    tensors: tuple[TensorManifest, ...] = field(repr=False)
+    metadata: tuple[tuple[str, str], ...] = field(repr=False)
+    metadata_form: MetadataForm
+    notices: tuple[HeaderNotice, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.plan) is not HeaderReadPlan:
+            raise TypeError("safetensors manifest plan must be HeaderReadPlan")
+        if type(self.tensors) is not tuple or not all(
+            type(tensor) is TensorManifest for tensor in self.tensors
+        ):
+            raise TypeError("manifest tensors must be a tuple of TensorManifest values")
+
+        rebuilt_tensors = tuple(
+            TensorManifest(
+                name=tensor.name,
+                dtype=tensor.dtype,
+                shape=tensor.shape,
+                data_offsets=tensor.data_offsets,
+                unknown_fields=tensor.unknown_fields,
+            )
+            for tensor in self.tensors
+        )
+        if any(
+            type(tensor.element_count) is not int
+            or tensor.element_count != rebuilt.element_count
+            or type(tensor.nbytes) is not int
+            or tensor.nbytes != rebuilt.nbytes
+            for tensor, rebuilt in zip(self.tensors, rebuilt_tensors, strict=True)
+        ):
+            raise ValueError("manifest tensor derived state is inconsistent")
+        object.__setattr__(self, "plan", _validated_plan_copy(self.plan))
+        object.__setattr__(self, "tensors", rebuilt_tensors)
+
+        decoded_tensors = tuple(
+            sorted(
+                (
+                    TensorHeader(
+                        name=tensor.name,
+                        dtype=tensor.dtype.value,
+                        shape=tensor.shape,
+                        data_offsets=tensor.data_offsets,
+                        unknown_fields=tensor.unknown_fields,
+                    )
+                    for tensor in self.tensors
+                ),
+                key=lambda tensor: tensor.name,
+            )
+        )
+        DecodedSafetensorsHeader(
+            plan=self.plan,
+            tensors=decoded_tensors,
+            metadata=self.metadata,
+            metadata_form=self.metadata_form,
+            notices=self.notices,
+        )
+
+        canonical = tuple(sorted(self.tensors, key=_manifest_storage_key))
+        if self.tensors != canonical:
+            raise ValueError("manifest tensors must use canonical storage order")
+        cursor = 0
+        for tensor in self.tensors:
+            begin, end = tensor.data_offsets
+            if begin != cursor:
+                raise ValueError("manifest tensor layout must be hole-free")
+            cursor = end
+        if cursor != self.plan.data_size:
+            raise ValueError("manifest tensor layout must cover the payload")
+
+    def __setstate__(self, _state: object) -> NoReturn:
+        """Reject state restoration that could bypass validation."""
+
+        raise TypeError(f"{type(self).__name__} is immutable")
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class _IntegerLexeme:
@@ -424,6 +711,56 @@ class _IntegerLexeme:
 @dataclass(frozen=True, slots=True, repr=False)
 class _FloatLexeme:
     value: str
+
+
+def _validated_limits_copy(limits: SafetensorsLimits) -> SafetensorsLimits:
+    return SafetensorsLimits(
+        max_header_bytes=limits.max_header_bytes,
+        max_json_depth=limits.max_json_depth,
+        max_json_string_chars=limits.max_json_string_chars,
+        max_json_tokens=limits.max_json_tokens,
+        max_tensors=limits.max_tensors,
+        max_tensor_rank=limits.max_tensor_rank,
+        max_tensor_name_bytes=limits.max_tensor_name_bytes,
+        max_metadata_entries=limits.max_metadata_entries,
+    )
+
+
+def _validated_plan_copy(plan: HeaderReadPlan) -> HeaderReadPlan:
+    return HeaderReadPlan(
+        file_size=plan.file_size,
+        header_size=plan.header_size,
+        header_offset=plan.header_offset,
+        data_offset=plan.data_offset,
+        data_size=plan.data_size,
+        limits=plan.limits,
+    )
+
+
+def _validated_envelope_copy(envelope: HeaderEnvelope) -> HeaderEnvelope:
+    return HeaderEnvelope(plan=envelope.plan, header=envelope.header)
+
+
+def _validated_tensor_header_copy(tensor: TensorHeader) -> TensorHeader:
+    return TensorHeader(
+        name=tensor.name,
+        dtype=tensor.dtype,
+        shape=tensor.shape,
+        data_offsets=tensor.data_offsets,
+        unknown_fields=tensor.unknown_fields,
+    )
+
+
+def _validated_decoded_copy(
+    decoded: DecodedSafetensorsHeader,
+) -> DecodedSafetensorsHeader:
+    return DecodedSafetensorsHeader(
+        plan=decoded.plan,
+        tensors=decoded.tensors,
+        metadata=decoded.metadata,
+        metadata_form=decoded.metadata_form,
+        notices=decoded.notices,
+    )
 
 
 def plan_header_read(
@@ -447,6 +784,7 @@ def plan_header_read(
         raise ValueError("file_size must not be negative")
     if type(limits) is not SafetensorsLimits:
         raise TypeError("limits must be SafetensorsLimits")
+    limits = _validated_limits_copy(limits)
     if file_size < 8:
         raise InvalidSafetensors(SafetensorsErrorCode.FILE_TOO_SMALL)
     if len(prefix) != 8:
@@ -497,6 +835,7 @@ def decode_header(envelope: HeaderEnvelope) -> DecodedSafetensorsHeader:
 
     if type(envelope) is not HeaderEnvelope:
         raise TypeError("envelope must be HeaderEnvelope")
+    envelope = _validated_envelope_copy(envelope)
 
     limits = envelope.plan.limits
     text: str | None = None
@@ -545,6 +884,112 @@ def decode_header(envelope: HeaderEnvelope) -> DecodedSafetensorsHeader:
         metadata_form=metadata_form,
         notices=tuple(sorted(notices, key=lambda notice: notice.value)),
     )
+
+
+def validate_storage(decoded: DecodedSafetensorsHeader) -> SafetensorsManifest:
+    """Prove dtype, tensor-size, layout, and payload-coverage invariants."""
+
+    if type(decoded) is not DecodedSafetensorsHeader:
+        raise TypeError("decoded must be DecodedSafetensorsHeader")
+    decoded = _validated_decoded_copy(decoded)
+
+    dtypes: dict[str, SafetensorsDtype] = {}
+    for tensor in decoded.tensors:
+        dtype: SafetensorsDtype | None = None
+        try:
+            dtype = SafetensorsDtype(tensor.dtype)
+        except ValueError:
+            pass
+        if dtype is None:
+            raise InvalidSafetensors(SafetensorsErrorCode.INVALID_DTYPE)
+        dtypes[tensor.name] = dtype
+
+    ordered = tuple(
+        sorted(
+            decoded.tensors,
+            key=lambda tensor: (tensor.data_offsets[0], tensor.data_offsets[1], tensor.name),
+        )
+    )
+    manifests: list[TensorManifest] = []
+    cursor = 0
+    for tensor in ordered:
+        begin, end = tensor.data_offsets
+        if begin > cursor:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_LAYOUT_GAP)
+        if begin < cursor:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_LAYOUT_OVERLAP)
+        if end < begin:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_OFFSETS_REVERSED)
+
+        dtype = dtypes[tensor.name]
+        _, expected_bytes = _checked_tensor_size(tensor.shape, dtype)
+        if end - begin != expected_bytes:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_SIZE_MISMATCH)
+        manifests.append(
+            TensorManifest(
+                name=tensor.name,
+                dtype=dtype,
+                shape=tensor.shape,
+                data_offsets=tensor.data_offsets,
+                unknown_fields=tensor.unknown_fields,
+            )
+        )
+        cursor = end
+
+    if cursor != decoded.plan.data_size:
+        raise InvalidSafetensors(SafetensorsErrorCode.PAYLOAD_SIZE_MISMATCH)
+
+    return SafetensorsManifest(
+        plan=decoded.plan,
+        tensors=tuple(manifests),
+        metadata=decoded.metadata,
+        metadata_form=decoded.metadata_form,
+        notices=decoded.notices,
+    )
+
+
+def parse_safetensors_manifest(
+    prefix: bytes,
+    header: bytes,
+    *,
+    file_size: int,
+    limits: SafetensorsLimits = DEFAULT_SAFETENSORS_LIMITS,
+) -> SafetensorsManifest:
+    """Compose the pure envelope, schema, and storage-validation stages.
+
+    This convenience API accepts already-acquired value evidence. A source
+    adapter must still bind the prefix, file size, and header to one unchanged
+    object and must use :func:`plan_header_read` before fetching the header.
+    """
+
+    plan = plan_header_read(prefix, file_size=file_size, limits=limits)
+    envelope = accept_header(plan, header)
+    decoded = decode_header(envelope)
+    return validate_storage(decoded)
+
+
+def _checked_tensor_size(
+    shape: tuple[int, ...],
+    dtype: SafetensorsDtype,
+) -> tuple[int, int]:
+    elements = 1
+    for dimension in shape:
+        if dimension != 0 and elements > _U64_MAX // dimension:
+            raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_SIZE_OVERFLOW)
+        elements *= dimension
+
+    bits = dtype.bits_per_element
+    if elements != 0 and elements > _U64_MAX // bits:
+        raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_SIZE_OVERFLOW)
+    total_bits = elements * bits
+    if total_bits % 8 != 0:
+        raise InvalidSafetensors(SafetensorsErrorCode.TENSOR_BYTE_MISALIGNED)
+    return elements, total_bits // 8
+
+
+def _manifest_storage_key(tensor: TensorManifest) -> tuple[int, int, str]:
+    begin, end = tensor.data_offsets
+    return begin, end, tensor.name
 
 
 def _prescan_json(text: str, limits: SafetensorsLimits) -> None:
@@ -649,10 +1094,6 @@ def _load_json(text: str, limits: SafetensorsLimits) -> object:
     return result
 
 
-def _has_lone_surrogate(value: str) -> bool:
-    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
-
-
 def _decode_metadata(
     members: dict[str, object],
     limits: SafetensorsLimits,
@@ -751,13 +1192,18 @@ __all__ = [
     "HeaderReadPlan",
     "InvalidSafetensors",
     "MetadataForm",
+    "SafetensorsDtype",
     "SafetensorsErrorCode",
     "SafetensorsInspectionError",
     "SafetensorsLimitExceeded",
     "SafetensorsLimits",
+    "SafetensorsManifest",
     "SafetensorsReadMismatch",
     "TensorHeader",
+    "TensorManifest",
     "accept_header",
     "decode_header",
+    "parse_safetensors_manifest",
     "plan_header_read",
+    "validate_storage",
 ]
