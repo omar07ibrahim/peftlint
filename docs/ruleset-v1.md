@@ -181,17 +181,21 @@ commit makes the audit unknown.
 ### PL100 — safetensors envelope
 
 The file has the safetensors envelope, a bounded valid JSON header, unique
-tensor names, valid shapes, and byte ranges within the declared file size. A
-format violation is incompatible. A valid dtype or format feature that the
-ruleset does not model makes dependent rules unknown rather than making the
-artifact malformed.
+tensor names, unsigned 64-bit shape and offset components, and an exact dtype
+token from the pinned safetensors v0.8 vocabulary. A structural format
+violation is incompatible. A dtype introduced after that pinned version is not
+silently accepted; a future profile must update the vocabulary deliberately.
+The 64-bit bound is peftlint's host-independent supported reader profile for
+upstream fields represented as Rust `usize`.
 
 ### PL101 — tensor storage
 
-Tensor byte spans agree with dtype and shape, do not overlap, and form a valid
-hole-free layout under the safetensors specification after spans are sorted by
-offset. Empty tensors are handled according to the format rather than treated
-as an arithmetic special case.
+Each offset pair is ordered, tensor byte spans agree exactly with dtype and
+shape under checked unsigned 64-bit arithmetic, and the spans form a
+hole-free, overlap-free layout after numeric sorting by start, end, and name.
+The final span must end at the declared payload boundary: both trailing bytes
+and a span beyond the file are PL101 failures. Empty tensors follow the format's
+ordered-product and byte-alignment semantics rather than an arithmetic shortcut.
 
 ### PL102 — tensor inventory closure
 
