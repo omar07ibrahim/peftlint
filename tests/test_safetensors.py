@@ -801,7 +801,7 @@ def test_json_token_limit_stops_wide_values_before_materialization(
     def forbidden_json_loads(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("json.loads must not run after the token limit")
 
-    monkeypatch.setattr("peftlint.safetensors.json.loads", forbidden_json_loads)
+    monkeypatch.setattr("peftlint._bounded_json.json.loads", forbidden_json_loads)
 
     with pytest.raises(SafetensorsLimitExceeded) as raised:
         _decode_bytes(header, limits=SafetensorsLimits(max_json_tokens=100))
