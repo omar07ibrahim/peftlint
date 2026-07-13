@@ -99,7 +99,8 @@ jobs:
           "$RUNNER_TEMP/peftlint-smoke/bin/pip" install \
             --no-index --find-links dist peftlint
       - name: Check installed dependencies
-        run: "$RUNNER_TEMP/peftlint-smoke/bin/python" -m pip check
+        run: |
+          "$RUNNER_TEMP/peftlint-smoke/bin/python" -m pip check
       - name: Check installed metadata, typing marker, and public API
         working-directory: ${{ runner.temp }}
         run: >-
