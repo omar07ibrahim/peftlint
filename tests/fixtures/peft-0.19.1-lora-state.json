@@ -1,0 +1,41 @@
+{
+  "schema": "peftlint.peft-source-fixture.v1",
+  "peft_version": "0.19.1",
+  "commit": "ba6a19060d6ab54a87538a6e77e3e4d5a907375b",
+  "sources": {
+    "saved_key_rewrite": "https://github.com/huggingface/peft/blob/v0.19.1/src/peft/utils/save_and_load.py",
+    "lora_shapes": "https://github.com/huggingface/peft/blob/v0.19.1/src/peft/tuners/lora/layer.py",
+    "auxiliary_wrappers": "https://github.com/huggingface/peft/blob/v0.19.1/src/peft/utils/other.py"
+  },
+  "pairs": [
+    {
+      "kind": "linear",
+      "target": "base_model.model.layers.0.self_attn.q_proj",
+      "a": {
+        "key": "base_model.model.layers.0.self_attn.q_proj.lora_A.weight",
+        "shape": [8, 64]
+      },
+      "b": {
+        "key": "base_model.model.layers.0.self_attn.q_proj.lora_B.weight",
+        "shape": [32, 8]
+      }
+    },
+    {
+      "kind": "embedding",
+      "target": "base_model.model.embed_tokens",
+      "a": {
+        "key": "base_model.model.embed_tokens.lora_embedding_A",
+        "shape": [8, 32000]
+      },
+      "b": {
+        "key": "base_model.model.embed_tokens.lora_embedding_B",
+        "shape": [4096, 8]
+      }
+    }
+  ],
+  "unclassified_keys": [
+    "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight",
+    "base_model.model.lm_head.weight",
+    "base_model.model.layers.0.self_attn.q_proj.lora_magnitude_vector"
+  ]
+}

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import random
 from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
+from typing import TypedDict, cast
 
 import pytest
 
@@ -29,6 +32,27 @@ from peftlint.safetensors import (
 
 def evidence_path(name: str) -> str:
     return f"tensor:{json.dumps(name, ensure_ascii=True)}"
+
+
+class FixtureTensor(TypedDict):
+    key: str
+    shape: list[int]
+
+
+class FixturePair(TypedDict):
+    kind: str
+    target: str
+    a: FixtureTensor
+    b: FixtureTensor
+
+
+class PeftSourceFixture(TypedDict):
+    schema: str
+    peft_version: str
+    commit: str
+    sources: dict[str, str]
+    pairs: list[FixturePair]
+    unclassified_keys: list[str]
 
 
 def weights_manifest(
@@ -100,6 +124,115 @@ def test_exact_linear_and_embedding_pairs_are_compiled() -> None:
     assert inventory.pairs[1].a.shape == (8, 64)
     assert inventory.pairs[1].b.shape == (32, 8)
     assert inventory.issues == ()
+
+
+def test_pinned_peft_source_fixture_compiles_without_runtime_dependencies() -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "peft-0.19.1-lora-state.json"
+    fixture = cast(PeftSourceFixture, json.loads(fixture_path.read_text(encoding="utf-8")))
+    tensors: list[tuple[str, tuple[int, ...], tuple[str, ...]]] = [
+        (member["key"], tuple(member["shape"]), ())
+        for pair in fixture["pairs"]
+        for member in (pair["a"], pair["b"])
+    ]
+    inventory = inspect_lora_inventory(weights_manifest(tensors))
+    expected_pairs = sorted(fixture["pairs"], key=lambda pair: (pair["target"], pair["kind"]))
+
+    assert fixture["schema"] == "peftlint.peft-source-fixture.v1"
+    assert fixture["peft_version"] == "0.19.1"
+    assert fixture["commit"] == "ba6a19060d6ab54a87538a6e77e3e4d5a907375b"
+    assert set(fixture["sources"]) == {
+        "auxiliary_wrappers",
+        "lora_shapes",
+        "saved_key_rewrite",
+    }
+    assert tuple((pair.kind.value, pair.target) for pair in inventory.pairs) == tuple(
+        (pair["kind"], pair["target"]) for pair in expected_pairs
+    )
+    assert tuple((pair.a.shape, pair.b.shape) for pair in inventory.pairs) == tuple(
+        (tuple(pair["a"]["shape"]), tuple(pair["b"]["shape"])) for pair in expected_pairs
+    )
+
+    unknown = inspect_lora_inventory(
+        weights_manifest([(name, (1,), ()) for name in fixture["unclassified_keys"]])
+    )
+    assert all(tensor.role is LoraTensorRole.UNCLASSIFIED for tensor in unknown.tensors)
+
+
+def test_seeded_terminal_key_corpus_is_exact_and_order_independent() -> None:
+    rng = random.Random(0x50454654)
+    suffixes = (
+        (".lora_A.weight", LoraTensorRole.LINEAR_A),
+        (".lora_B.weight", LoraTensorRole.LINEAR_B),
+        (".lora_embedding_A", LoraTensorRole.EMBEDDING_A),
+        (".lora_embedding_B", LoraTensorRole.EMBEDDING_B),
+    )
+    components = ("q_proj", "v_proj", "lora_Aux", "caf\u00e9", "cafe\u0301")
+    tensors: list[tuple[str, tuple[int, ...], tuple[str, ...]]] = []
+    expected: dict[str, tuple[LoraTensorRole, str | None]] = {}
+    for index in range(128):
+        target = f"model.layers.{index}.{rng.choice(components)}"
+        suffix, role = rng.choice(suffixes)
+        canonical = f"{target}{suffix}"
+        if role is LoraTensorRole.LINEAR_A:
+            near_match = f"{target}.lora_A.default.weight"
+        elif role is LoraTensorRole.LINEAR_B:
+            near_match = f"{target}.lora_B.bias"
+        elif role is LoraTensorRole.EMBEDDING_A:
+            near_match = f"{target}.lora_embedding_A.weight"
+        else:
+            near_match = f"{target}.lora_embedding_B.default"
+        tensors.extend(((canonical, (1,), ()), (near_match, (1,), ())))
+        expected[canonical] = (role, target)
+        expected[near_match] = (LoraTensorRole.UNCLASSIFIED, None)
+    rng.shuffle(tensors)
+
+    inventory = inspect_lora_inventory(weights_manifest(tensors))
+
+    assert len(inventory.tensors) == 256
+    assert {tensor.name: (tensor.role, tensor.target) for tensor in inventory.tensors} == expected
+
+
+def test_metadata_does_not_change_semantic_inventory() -> None:
+    source = weights_manifest(
+        [
+            ("model.q.lora_A.weight", (4, 7), ()),
+            ("model.q.lora_B.weight", (9, 4), ()),
+        ]
+    )
+    with_metadata = SafetensorsManifest(
+        plan=source.plan,
+        tensors=source.tensors,
+        metadata=(("format", "pt"),),
+        metadata_form=MetadataForm.OBJECT,
+        notices=source.notices,
+    )
+
+    plain = inspect_lora_inventory(source)
+    annotated = inspect_lora_inventory(with_metadata)
+
+    assert (plain.tensors, plain.pairs, plain.issues) == (
+        annotated.tensors,
+        annotated.pairs,
+        annotated.issues,
+    )
+
+
+def test_unicode_normalization_is_never_applied_to_targets() -> None:
+    composed = "model.caf\u00e9"
+    decomposed = "model.cafe\u0301"
+    inventory = inspect_lora_inventory(
+        weights_manifest(
+            [
+                (f"{composed}.lora_A.weight", (4, 7), ()),
+                (f"{composed}.lora_B.weight", (9, 4), ()),
+                (f"{decomposed}.lora_A.weight", (4, 7), ()),
+                (f"{decomposed}.lora_B.weight", (9, 4), ()),
+            ]
+        )
+    )
+
+    assert tuple(pair.target for pair in inventory.pairs) == (decomposed, composed)
+    assert inventory.pairs[0].target != inventory.pairs[1].target
 
 
 def test_inventory_ignores_physical_storage_order() -> None:
