@@ -1134,8 +1134,16 @@ def test_manifest_requires_source_fields_for_every_nondefault_profile_value(
 def test_manual_manifest_invariants_reject_inconsistent_evidence() -> None:
     manifest = parse_config({"peft_type": "LORA"})
 
+    class AlwaysEqual:
+        def __eq__(self, _other: object) -> bool:
+            return True
+
     with pytest.raises(ValueError, match="schema must identify"):
         replace(manifest, schema="future")
+    with pytest.raises(TypeError, match="adapter config schema must be a string"):
+        replace(manifest, schema=AlwaysEqual())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="declared_peft_type must be a string or None"):
+        replace(manifest, declared_peft_type=AlwaysEqual())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="requires declared"):
         replace(manifest, declared_peft_type="IA3")
     with pytest.raises(ValueError, match="canonical order"):

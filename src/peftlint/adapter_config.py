@@ -531,8 +531,12 @@ class AdapterConfigManifest:
     issues: tuple[ConfigFieldIssue, ...]
 
     def __post_init__(self) -> None:
+        if type(self.schema) is not str:
+            raise TypeError("adapter config schema must be a string")
         if self.schema != ADAPTER_CONFIG_SCHEMA:
             raise ValueError("schema must identify the pinned adapter config schema")
+        if self.declared_peft_type is not None and type(self.declared_peft_type) is not str:
+            raise TypeError("declared_peft_type must be a string or None")
         _require_exact_enum("method_status", self.method_status, AdapterMethodStatus)
         _require_text_tuple("explicit_fields", self.explicit_fields, allow_empty_items=True)
         if self.explicit_fields != tuple(sorted(frozenset(self.explicit_fields))):
