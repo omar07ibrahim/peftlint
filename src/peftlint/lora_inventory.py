@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import NoReturn
@@ -51,11 +53,8 @@ _SAVED_SUFFIXES = (
     (".lora_A.weight", LoraTensorRole.LINEAR_A),
     (".lora_B.weight", LoraTensorRole.LINEAR_B),
 )
-_RESERVED_TARGET_MARKERS = (
-    ".lora_embedding_A",
-    ".lora_embedding_B",
-    ".lora_A",
-    ".lora_B",
+_RESERVED_TARGET_COMPONENTS = frozenset(
+    {"lora_embedding_A", "lora_embedding_B", "lora_A", "lora_B"}
 )
 
 
@@ -71,7 +70,7 @@ class LoraTensor:
     unknown_fields: tuple[str, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
-        _require_text("tensor name", self.name)
+        _require_unicode("tensor name", self.name)
         if type(self.dtype) is not SafetensorsDtype:
             raise TypeError("tensor dtype must be SafetensorsDtype")
         if type(self.shape) is not tuple or any(
@@ -80,13 +79,15 @@ class LoraTensor:
             raise TypeError("tensor shape must be a tuple of integers")
         if any(not 0 <= dimension <= _U64_MAX for dimension in self.shape):
             raise ValueError("tensor shape dimensions must fit unsigned 64-bit values")
-        _require_text_tuple("unknown_fields", self.unknown_fields)
+        _require_unicode_tuple("unknown_fields", self.unknown_fields)
         if self.unknown_fields != tuple(sorted(frozenset(self.unknown_fields))):
             raise ValueError("unknown_fields must be sorted and unique")
         if frozenset(self.unknown_fields) & _REQUIRED_TENSOR_FIELDS:
             raise ValueError("required tensor fields cannot be unknown fields")
         if type(self.role) is not LoraTensorRole:
             raise TypeError("tensor role must be LoraTensorRole")
+        if self.target is not None:
+            _require_text("tensor target", self.target)
 
         expected_role, expected_target = _classify_saved_key(self.name)
         if self.role is not expected_role or self.target != expected_target:
@@ -97,6 +98,12 @@ class LoraTensor:
         """Return the canonical member order."""
 
         return self.name, self.role.value
+
+    @property
+    def evidence_path(self) -> str:
+        """Return an injective printable scope for any valid raw tensor key."""
+
+        return f"tensor:{json.dumps(self.name, ensure_ascii=True)}"
 
     def __setstate__(self, _state: object) -> NoReturn:
         raise TypeError(f"{type(self).__name__} is immutable")
@@ -144,10 +151,11 @@ class LoraPair:
 
 @dataclass(frozen=True, slots=True)
 class LoraInventoryIssue:
-    """One deterministic issue, scoped to a raw key when one exists."""
+    """One deterministic issue, scoped to a tensor key or exact target."""
 
     kind: LoraInventoryIssueKind
     tensor: LoraTensor | None = field(default=None, repr=False)
+    target: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.kind) is not LoraInventoryIssueKind:
@@ -156,12 +164,18 @@ class LoraInventoryIssue:
             raise TypeError("inventory issue tensor must be LoraTensor or None")
         if self.tensor is not None:
             object.__setattr__(self, "tensor", _copy_tensor(self.tensor))
+        if self.target is not None:
+            _require_text("inventory issue target", self.target)
 
         if self.kind is LoraInventoryIssueKind.EMPTY_INVENTORY:
-            if self.tensor is not None:
-                raise ValueError("empty-inventory issue must not name a tensor")
+            if self.tensor is not None or self.target is not None:
+                raise ValueError("empty-inventory issue must not name a tensor or target")
             return
-        if self.tensor is None:
+        if self.kind is LoraInventoryIssueKind.MIXED_PAIR_KIND:
+            if self.tensor is not None or self.target is None:
+                raise ValueError("mixed-kind issue requires only an exact target")
+            return
+        if self.tensor is None or self.target is not None:
             raise ValueError("tensor-scoped inventory issue requires a tensor")
         if self.kind is LoraInventoryIssueKind.UNCLASSIFIED_TENSOR:
             if self.tensor.role is not LoraTensorRole.UNCLASSIFIED:
@@ -176,9 +190,13 @@ class LoraInventoryIssue:
 
     @property
     def logical_path(self) -> str | None:
-        """Return the collision-free raw tensor-key scope, when present."""
+        """Return the injective printable evidence scope, when present."""
 
-        return None if self.tensor is None else self.tensor.name
+        if self.tensor is not None:
+            return self.tensor.evidence_path
+        if self.target is not None:
+            return f"target:{json.dumps(self.target, ensure_ascii=True)}"
+        return None
 
     @property
     def sort_key(self) -> tuple[str, str, str]:
@@ -202,6 +220,8 @@ class LoraInventory:
     issues: tuple[LoraInventoryIssue, ...]
 
     def __post_init__(self) -> None:
+        if type(self.schema) is not str:
+            raise TypeError("inventory schema must be a string")
         if self.schema != LORA_INVENTORY_SCHEMA:
             raise ValueError("schema must identify the pinned LoRA inventory schema")
         if type(self.weights) is not SafetensorsManifest:
@@ -297,12 +317,9 @@ def _classify_saved_key(name: str) -> tuple[LoraTensorRole, str | None]:
 
 
 def _is_unambiguous_target(target: str) -> bool:
+    components = target.split(".")
     return bool(
-        target
-        and not target.startswith(".")
-        and not target.endswith(".")
-        and ".." not in target
-        and not any(marker in target for marker in _RESERVED_TARGET_MARKERS)
+        target and all(components) and not _RESERVED_TARGET_COMPONENTS.intersection(components)
     )
 
 
@@ -312,7 +329,8 @@ def _compile_relationships(
     if not tensors:
         return (), (LoraInventoryIssue(LoraInventoryIssueKind.EMPTY_INVENTORY),)
 
-    grouped: dict[str, dict[LoraTensorRole, LoraTensor]] = {}
+    grouped: dict[tuple[str, LoraPairKind], dict[LoraTensorRole, LoraTensor]] = {}
+    kinds_by_target: dict[str, set[LoraPairKind]] = defaultdict(set)
     issues: list[LoraInventoryIssue] = []
     for tensor in tensors:
         if tensor.role is LoraTensorRole.UNCLASSIFIED:
@@ -322,19 +340,14 @@ def _compile_relationships(
             issues.append(LoraInventoryIssue(LoraInventoryIssueKind.UNKNOWN_TENSOR_FIELDS, tensor))
         if tensor.target is None:  # Defensive guard for forged values.
             raise ValueError("recognized inventory tensor must have a target")
-        grouped.setdefault(tensor.target, {})[tensor.role] = tensor
+        kind = _kind_for_role(tensor.role)
+        grouped.setdefault((tensor.target, kind), {})[tensor.role] = tensor
+        kinds_by_target.setdefault(tensor.target, set()).add(kind)
 
     pairs: list[LoraPair] = []
-    for target, members in sorted(grouped.items()):
-        kinds = frozenset(_kind_for_role(role) for role in members)
-        if len(kinds) != 1:
-            issues.extend(
-                LoraInventoryIssue(LoraInventoryIssueKind.MIXED_PAIR_KIND, tensor)
-                for tensor in members.values()
-            )
-            continue
-
-        kind = next(iter(kinds))
+    for (target, kind), members in sorted(
+        grouped.items(), key=lambda item: (item[0][0], item[0][1].value)
+    ):
         a_role, b_role = {
             LoraPairKind.LINEAR: (LoraTensorRole.LINEAR_A, LoraTensorRole.LINEAR_B),
             LoraPairKind.EMBEDDING: (
@@ -349,6 +362,12 @@ def _compile_relationships(
                 LoraInventoryIssue(LoraInventoryIssueKind.ORPHAN_MEMBER, tensor)
                 for tensor in members.values()
             )
+
+    issues.extend(
+        LoraInventoryIssue(LoraInventoryIssueKind.MIXED_PAIR_KIND, target=target)
+        for target, kinds in kinds_by_target.items()
+        if len(kinds) > 1
+    )
 
     return (
         tuple(sorted(pairs, key=lambda pair: pair.sort_key)),
@@ -390,7 +409,7 @@ def _copy_pair(pair: LoraPair) -> LoraPair:
 
 
 def _copy_issue(issue: LoraInventoryIssue) -> LoraInventoryIssue:
-    return LoraInventoryIssue(issue.kind, issue.tensor)
+    return LoraInventoryIssue(issue.kind, issue.tensor, issue.target)
 
 
 def _require_text(name: str, value: object) -> None:
@@ -400,11 +419,18 @@ def _require_text(name: str, value: object) -> None:
         raise ValueError(f"{name} must be non-empty valid Unicode")
 
 
-def _require_text_tuple(name: str, value: object) -> None:
+def _require_unicode(name: str, value: object) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    if _has_lone_surrogate(value):
+        raise ValueError(f"{name} must contain valid Unicode")
+
+
+def _require_unicode_tuple(name: str, value: object) -> None:
     if type(value) is not tuple or any(type(item) is not str for item in value):
         raise TypeError(f"{name} must be a tuple of strings")
-    if any(not item or _has_lone_surrogate(item) for item in value):
-        raise ValueError(f"{name} must contain non-empty valid Unicode strings")
+    if any(_has_lone_surrogate(item) for item in value):
+        raise ValueError(f"{name} must contain valid Unicode strings")
 
 
 def _require_exact_tuple(name: str, value: object, item_type: type[object]) -> None:
