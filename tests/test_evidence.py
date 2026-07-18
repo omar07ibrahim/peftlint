@@ -110,6 +110,32 @@ def test_different_artifacts_can_contribute_to_the_same_audit() -> None:
     assert summarize(results).verdict is Verdict.COMPATIBLE
 
 
+def test_same_rule_and_path_are_distinct_across_artifacts() -> None:
+    results = all_pass_results()
+    results[0] = replace(
+        results[0],
+        artifact="adapter@sha256:one",
+        logical_path="config.json",
+    )
+    results.append(
+        replace(
+            results[0],
+            artifact="base@sha256:two",
+            message="evaluated the same path in another artifact",
+        )
+    )
+
+    summary = summarize(results)
+
+    assert summary.verdict is Verdict.COMPATIBLE
+    assert tuple(
+        (item.artifact, item.logical_path) for item in summary.results if item.rule_id == "PL001"
+    ) == (
+        ("adapter@sha256:one", "config.json"),
+        ("base@sha256:two", "config.json"),
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
