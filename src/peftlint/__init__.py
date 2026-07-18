@@ -37,6 +37,7 @@ from peftlint.evidence import (
     Verdict,
     summarize_load,
 )
+from peftlint.lora_evaluation import evaluate_lora_inventory
 from peftlint.lora_inventory import (
     LORA_INVENTORY_SCHEMA,
     LoraInventory,
@@ -118,6 +119,7 @@ __all__ = [
     "Severity",
     "TensorManifest",
     "Verdict",
+    "evaluate_lora_inventory",
     "inspect_lora_inventory",
     "parse_adapter_config",
     "parse_safetensors_manifest",
