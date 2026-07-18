@@ -177,7 +177,6 @@ def test_orphan_is_inventory_closed_but_pair_incompatible() -> None:
     [
         ((), (32, 8)),
         ((8,), (32, 8)),
-        ((8, 64, 1), (32, 8)),
         ((0, 64), (32, 0)),
         ((8, 0), (32, 8)),
         ((8, 64), (0, 8)),
@@ -188,6 +187,59 @@ def test_malformed_pair_dimensions_never_become_rank_evidence(
     a_shape: tuple[int, ...], b_shape: tuple[int, ...]
 ) -> None:
     results = evaluate(linear_pair(a_shape=a_shape, b_shape=b_shape))
+
+    assert outcomes(results, "PL102") == (RuleOutcome.PASS,)
+    assert outcomes(results, "PL110") == (RuleOutcome.PASS,)
+    assert outcomes(results, "PL111") == (RuleOutcome.CONTRADICTION,)
+    assert outcomes(results, "PL112") == (RuleOutcome.UNKNOWN,)
+
+
+@pytest.mark.parametrize(
+    ("a_shape", "b_shape"),
+    [
+        ((8, 64, 3), (32, 8, 1)),
+        ((8, 64, 3, 3), (32, 8, 1, 1)),
+        ((8, 64, 3, 3, 3), (32, 8, 1, 1, 1)),
+    ],
+    ids=("conv1d", "conv2d", "conv3d"),
+)
+def test_convolution_weight_pairs_are_unsupported_not_incompatible(
+    a_shape: tuple[int, ...], b_shape: tuple[int, ...]
+) -> None:
+    results = evaluate(linear_pair(a_shape=a_shape, b_shape=b_shape))
+
+    assert outcomes(results, "PL102") == (RuleOutcome.UNKNOWN,)
+    assert outcomes(results, "PL110") == (RuleOutcome.PASS,)
+    assert outcomes(results, "PL111") == (RuleOutcome.UNKNOWN,)
+    assert outcomes(results, "PL112") == (RuleOutcome.UNKNOWN,)
+
+
+@pytest.mark.parametrize(
+    ("a_shape", "b_shape"),
+    [
+        ((8, 32000, 1), (4096, 8)),
+        ((8, 32000), (4096, 8, 1)),
+    ],
+)
+def test_embedding_suffixes_make_non_matrix_shapes_contradictory(
+    a_shape: tuple[int, ...], b_shape: tuple[int, ...]
+) -> None:
+    tensors: list[tuple[str, tuple[int, ...], SafetensorsDtype, Mapping[str, object]]] = [
+        (
+            "base_model.model.embed_tokens.lora_embedding_A",
+            a_shape,
+            SafetensorsDtype.F32,
+            {},
+        ),
+        (
+            "base_model.model.embed_tokens.lora_embedding_B",
+            b_shape,
+            SafetensorsDtype.F32,
+            {},
+        ),
+    ]
+
+    results = evaluate(tensors)
 
     assert outcomes(results, "PL102") == (RuleOutcome.PASS,)
     assert outcomes(results, "PL110") == (RuleOutcome.PASS,)
@@ -361,7 +413,17 @@ def test_closed_profile_is_required_before_configured_rank_can_pass() -> None:
     results = evaluate(linear_pair(), use_dora=True)
 
     assert outcomes(results, "PL102") == (RuleOutcome.UNKNOWN,)
+    assert outcomes(results, "PL110") == (RuleOutcome.UNKNOWN,)
+    assert outcomes(results, "PL111") == (RuleOutcome.UNKNOWN,)
     assert outcomes(results, "PL112") == (RuleOutcome.UNKNOWN,)
+
+
+def test_unmodeled_config_suppresses_orphan_and_shape_contradictions() -> None:
+    orphan_results = evaluate(linear_pair()[:1], use_dora=True)
+    shaped_results = evaluate(linear_pair(a_shape=(8,), b_shape=(32, 8)), use_dora=True)
+
+    for results in (orphan_results, shaped_results):
+        assert {result.outcome for result in results} == {RuleOutcome.UNKNOWN}
 
 
 def test_empty_inventory_semantics_are_explicit() -> None:
@@ -443,6 +505,31 @@ def test_evaluator_revalidates_equality_coercing_config_state(field_name: str) -
     with pytest.raises(TypeError):
         evaluate_lora_inventory(
             config,
+            inventory,
+            audit_id=AUDIT_ID,
+            artifact=ARTIFACT,
+        )
+
+
+def test_evaluator_revalidates_forged_nested_config_and_inventory_state() -> None:
+    config = config_manifest()
+    assert config.lora is not None
+    object.__setattr__(config.lora, "r", 0)
+    inventory = inspect_lora_inventory(weights_manifest(linear_pair()))
+
+    with pytest.raises(ValueError):
+        evaluate_lora_inventory(
+            config,
+            inventory,
+            audit_id=AUDIT_ID,
+            artifact=ARTIFACT,
+        )
+
+    valid_config = config_manifest()
+    object.__setattr__(inventory.pairs[0].a, "shape", [8, 64])
+    with pytest.raises(TypeError):
+        evaluate_lora_inventory(
+            valid_config,
             inventory,
             audit_id=AUDIT_ID,
             artifact=ARTIFACT,

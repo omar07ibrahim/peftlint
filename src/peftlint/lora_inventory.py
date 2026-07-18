@@ -23,17 +23,17 @@ _REQUIRED_TENSOR_FIELDS = frozenset({"dtype", "shape", "data_offsets"})
 class LoraTensorRole(StrEnum):
     """A role proved solely from one exact saved-state key."""
 
-    LINEAR_A = "linear_a"
-    LINEAR_B = "linear_b"
+    WEIGHT_A = "weight_a"
+    WEIGHT_B = "weight_b"
     EMBEDDING_A = "embedding_a"
     EMBEDDING_B = "embedding_b"
     UNCLASSIFIED = "unclassified"
 
 
 class LoraPairKind(StrEnum):
-    """The two PEFT 0.19.1 LoRA orientations modeled by this inventory."""
+    """The two PEFT 0.19.1 saved-key pair families modeled here."""
 
-    LINEAR = "linear"
+    WEIGHT = "weight"
     EMBEDDING = "embedding"
 
 
@@ -45,13 +45,14 @@ class LoraInventoryIssueKind(StrEnum):
     UNKNOWN_TENSOR_FIELDS = "unknown_tensor_fields"
     ORPHAN_MEMBER = "orphan_member"
     MIXED_PAIR_KIND = "mixed_pair_kind"
+    UNMODELED_WEIGHT_ORIENTATION = "unmodeled_weight_orientation"
 
 
 _SAVED_SUFFIXES = (
     (".lora_embedding_A", LoraTensorRole.EMBEDDING_A),
     (".lora_embedding_B", LoraTensorRole.EMBEDDING_B),
-    (".lora_A.weight", LoraTensorRole.LINEAR_A),
-    (".lora_B.weight", LoraTensorRole.LINEAR_B),
+    (".lora_A.weight", LoraTensorRole.WEIGHT_A),
+    (".lora_B.weight", LoraTensorRole.WEIGHT_B),
 )
 _RESERVED_TARGET_COMPONENTS = frozenset(
     {"lora_embedding_A", "lora_embedding_B", "lora_A", "lora_B"}
@@ -128,7 +129,7 @@ class LoraPair:
         object.__setattr__(self, "b", _copy_tensor(self.b))
 
         expected_roles = {
-            LoraPairKind.LINEAR: (LoraTensorRole.LINEAR_A, LoraTensorRole.LINEAR_B),
+            LoraPairKind.WEIGHT: (LoraTensorRole.WEIGHT_A, LoraTensorRole.WEIGHT_B),
             LoraPairKind.EMBEDDING: (
                 LoraTensorRole.EMBEDDING_A,
                 LoraTensorRole.EMBEDDING_B,
@@ -349,14 +350,22 @@ def _compile_relationships(
         grouped.items(), key=lambda item: (item[0][0], item[0][1].value)
     ):
         a_role, b_role = {
-            LoraPairKind.LINEAR: (LoraTensorRole.LINEAR_A, LoraTensorRole.LINEAR_B),
+            LoraPairKind.WEIGHT: (LoraTensorRole.WEIGHT_A, LoraTensorRole.WEIGHT_B),
             LoraPairKind.EMBEDDING: (
                 LoraTensorRole.EMBEDDING_A,
                 LoraTensorRole.EMBEDDING_B,
             ),
         }[kind]
         if a_role in members and b_role in members:
-            pairs.append(LoraPair(target, kind, members[a_role], members[b_role]))
+            pair = LoraPair(target, kind, members[a_role], members[b_role])
+            pairs.append(pair)
+            if kind is LoraPairKind.WEIGHT and (len(pair.a.shape) > 2 or len(pair.b.shape) > 2):
+                issues.append(
+                    LoraInventoryIssue(
+                        LoraInventoryIssueKind.UNMODELED_WEIGHT_ORIENTATION,
+                        pair.a,
+                    )
+                )
         else:
             issues.extend(
                 LoraInventoryIssue(LoraInventoryIssueKind.ORPHAN_MEMBER, tensor)
@@ -376,8 +385,8 @@ def _compile_relationships(
 
 
 def _kind_for_role(role: LoraTensorRole) -> LoraPairKind:
-    if role in {LoraTensorRole.LINEAR_A, LoraTensorRole.LINEAR_B}:
-        return LoraPairKind.LINEAR
+    if role in {LoraTensorRole.WEIGHT_A, LoraTensorRole.WEIGHT_B}:
+        return LoraPairKind.WEIGHT
     if role in {LoraTensorRole.EMBEDDING_A, LoraTensorRole.EMBEDDING_B}:
         return LoraPairKind.EMBEDDING
     raise ValueError("unclassified tensor has no LoRA pair kind")

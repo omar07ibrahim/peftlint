@@ -17,6 +17,7 @@ from peftlint.lora_inventory import (
     LoraInventory,
     LoraInventoryIssueKind,
     LoraPair,
+    LoraPairKind,
 )
 
 _PL102_UNKNOWN_ISSUES = frozenset(
@@ -25,6 +26,7 @@ _PL102_UNKNOWN_ISSUES = frozenset(
         LoraInventoryIssueKind.UNCLASSIFIED_TENSOR,
         LoraInventoryIssueKind.UNKNOWN_TENSOR_FIELDS,
         LoraInventoryIssueKind.MIXED_PAIR_KIND,
+        LoraInventoryIssueKind.UNMODELED_WEIGHT_ORIENTATION,
     }
 )
 _PAIR_DEPENDENCY_ISSUES = frozenset(
@@ -52,8 +54,8 @@ def evaluate_lora_inventory(
     validated_inventory = _copy_inventory(inventory)
     results = (
         *_evaluate_pl102(validated_config, validated_inventory, audit_id, artifact),
-        *_evaluate_pl110(validated_inventory, audit_id, artifact),
-        *_evaluate_pl111(validated_inventory, audit_id, artifact),
+        *_evaluate_pl110(validated_config, validated_inventory, audit_id, artifact),
+        *_evaluate_pl111(validated_config, validated_inventory, audit_id, artifact),
         *_evaluate_pl112(validated_config, validated_inventory, audit_id, artifact),
     )
     ordered = tuple(sorted(results, key=lambda result: result.sort_key))
@@ -112,10 +114,23 @@ def _evaluate_pl102(
 
 
 def _evaluate_pl110(
+    config: AdapterConfigManifest,
     inventory: LoraInventory,
     audit_id: str,
     artifact: str,
 ) -> tuple[RuleResult, ...]:
+    if not config.closed_profile:
+        return (
+            _result(
+                "PL110",
+                RuleOutcome.UNKNOWN,
+                audit_id,
+                artifact,
+                message="pair completeness needs a closed ordinary LoRA profile",
+                expected="closed LoRA configuration",
+            ),
+        )
+
     results: list[RuleResult] = []
     for issue in inventory.issues:
         if issue.kind not in _PAIR_DEPENDENCY_ISSUES or issue.tensor is None:
@@ -179,10 +194,23 @@ def _evaluate_pl110(
 
 
 def _evaluate_pl111(
+    config: AdapterConfigManifest,
     inventory: LoraInventory,
     audit_id: str,
     artifact: str,
 ) -> tuple[RuleResult, ...]:
+    if not config.closed_profile:
+        return (
+            _result(
+                "PL111",
+                RuleOutcome.UNKNOWN,
+                audit_id,
+                artifact,
+                message="pair dimensions need a closed ordinary LoRA profile",
+                expected="closed LoRA configuration",
+            ),
+        )
+
     results: list[RuleResult] = []
     for pair in inventory.pairs:
         results.append(_dimension_result(pair, audit_id, artifact))
@@ -227,6 +255,19 @@ def _dimension_result(pair: LoraPair, audit_id: str, artifact: str) -> RuleResul
             artifact,
             logical_path=path,
             message="pair dimensions cannot close across unknown tensor fields",
+            witness=(EvidenceField("pair_kind", pair.kind.value),),
+        )
+
+    if pair.kind is LoraPairKind.WEIGHT and (len(pair.a.shape) > 2 or len(pair.b.shape) > 2):
+        return _result(
+            "PL111",
+            RuleOutcome.UNKNOWN,
+            audit_id,
+            artifact,
+            logical_path=path,
+            message="weight-backed pair may use an unmodeled convolution orientation",
+            observed=f"{len(pair.a.shape)}:{len(pair.b.shape)}",
+            expected="modeled dense or embedding orientation",
             witness=(EvidenceField("pair_kind", pair.kind.value),),
         )
 

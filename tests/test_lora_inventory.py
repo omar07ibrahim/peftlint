@@ -52,6 +52,7 @@ class PeftSourceFixture(TypedDict):
     commit: str
     sources: dict[str, str]
     pairs: list[FixturePair]
+    unmodeled_weight_pairs: list[FixturePair]
     unclassified_keys: list[str]
 
 
@@ -117,7 +118,7 @@ def test_exact_linear_and_embedding_pairs_are_compiled() -> None:
     )
     assert tuple((pair.target, pair.kind) for pair in inventory.pairs) == (
         ("model.embed", LoraPairKind.EMBEDDING),
-        ("model.q_proj", LoraPairKind.LINEAR),
+        ("model.q_proj", LoraPairKind.WEIGHT),
     )
     assert inventory.pairs[0].a.shape == (8, 32000)
     assert inventory.pairs[0].b.shape == (4096, 8)
@@ -157,12 +158,26 @@ def test_pinned_peft_source_fixture_compiles_without_runtime_dependencies() -> N
     )
     assert all(tensor.role is LoraTensorRole.UNCLASSIFIED for tensor in unknown.tensors)
 
+    for pair in fixture["unmodeled_weight_pairs"]:
+        candidate = inspect_lora_inventory(
+            weights_manifest(
+                [
+                    (pair["a"]["key"], tuple(pair["a"]["shape"]), ()),
+                    (pair["b"]["key"], tuple(pair["b"]["shape"]), ()),
+                ]
+            )
+        )
+        assert tuple(item.kind for item in candidate.pairs) == (LoraPairKind.WEIGHT,)
+        assert tuple(issue.kind for issue in candidate.issues) == (
+            LoraInventoryIssueKind.UNMODELED_WEIGHT_ORIENTATION,
+        )
+
 
 def test_seeded_terminal_key_corpus_is_exact_and_order_independent() -> None:
     rng = random.Random(0x50454654)
     suffixes = (
-        (".lora_A.weight", LoraTensorRole.LINEAR_A),
-        (".lora_B.weight", LoraTensorRole.LINEAR_B),
+        (".lora_A.weight", LoraTensorRole.WEIGHT_A),
+        (".lora_B.weight", LoraTensorRole.WEIGHT_B),
         (".lora_embedding_A", LoraTensorRole.EMBEDDING_A),
         (".lora_embedding_B", LoraTensorRole.EMBEDDING_B),
     )
@@ -173,9 +188,9 @@ def test_seeded_terminal_key_corpus_is_exact_and_order_independent() -> None:
         target = f"model.layers.{index}.{rng.choice(components)}"
         suffix, role = rng.choice(suffixes)
         canonical = f"{target}{suffix}"
-        if role is LoraTensorRole.LINEAR_A:
+        if role is LoraTensorRole.WEIGHT_A:
             near_match = f"{target}.lora_A.default.weight"
-        elif role is LoraTensorRole.LINEAR_B:
+        elif role is LoraTensorRole.WEIGHT_B:
             near_match = f"{target}.lora_B.bias"
         elif role is LoraTensorRole.EMBEDDING_A:
             near_match = f"{target}.lora_embedding_A.weight"
@@ -351,7 +366,7 @@ def test_linear_and_embedding_members_at_one_target_are_not_guessed() -> None:
         )
     )
 
-    assert tuple(pair.kind for pair in inventory.pairs) == (LoraPairKind.LINEAR,)
+    assert tuple(pair.kind for pair in inventory.pairs) == (LoraPairKind.WEIGHT,)
     assert {issue.kind for issue in inventory.issues} == {
         LoraInventoryIssueKind.MIXED_PAIR_KIND,
         LoraInventoryIssueKind.ORPHAN_MEMBER,
