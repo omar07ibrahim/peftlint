@@ -22,10 +22,7 @@ The public entry point accepts bytes and optional resource limits:
 ```python
 from peftlint import parse_adapter_config
 
-manifest = parse_adapter_config(
-    b'{"peft_type":"LORA","r":16,'
-    b'"target_modules":["q_proj","v_proj"]}'
-)
+manifest = parse_adapter_config(b'{"peft_type":"LORA","r":16,"target_modules":["q_proj","v_proj"]}')
 
 assert manifest.closed_profile
 assert manifest.lora is not None
