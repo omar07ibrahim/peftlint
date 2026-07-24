@@ -28,8 +28,10 @@ which the `v0.19.1` tag resolves to.
 | Config structural evidence | Implemented |
 | Safetensors envelope and storage proof | Implemented |
 | Rule-result reducer | Implemented |
+| LoRA saved-key inventory | Implemented |
+| PL102, PL110, PL111, and bounded PL112 evaluators | Implemented |
 | Config-to-PL004 evaluator | Not implemented |
-| Inventory and base-model reconciliation | Not implemented |
+| Base-model reconciliation | Not implemented |
 | Hotswap evaluation | Not implemented |
 | Canonical report serialization | Not implemented |
 
@@ -134,17 +136,32 @@ Every emitted rule result must contain:
 - observed and expected values when both are safe to record;
 - whether the rule passed, contradicted the contract, or could not run.
 
-Ordering must be deterministic: profile, rule identifier, artifact, logical
-path. The report serializer must use the JSON Canonicalization Scheme in
+One rule may emit several findings. A finding's evidence-scope identity is the
+exact tuple `(profile, rule identifier, artifact, logical path)`: the same
+logical path in two artifacts is distinct evidence, while a duplicate tuple is
+rejected even when its message or outcome differs. Strings are compared exactly
+without case folding or Unicode normalization.
+
+The shipped load reducer aggregates every finding for a rule. Any contradiction
+owns that rule's outcome; otherwise any unknown owns it; only an all-pass set
+passes. At profile level, a contradiction takes precedence over unknown or
+missing evidence, while a missing mandatory rule is fail-closed `unknown`.
+Contradicting and unknown rule summaries are disjoint. Every evaluator must
+therefore emit at least one finding for each rule it claims to implement; an
+incomplete producer cannot represent absence as success.
+
+Ordering is deterministic: profile, rule identifier, artifact, logical path.
+The report serializer must use the JSON Canonicalization Scheme in
 [RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785). Until that serializer
 is implemented and tested, `peftlint` does not claim byte-equivalent canonical
 reports.
 
 ## 6. Supported configuration profile
 
-The first implementation profile is `peft-0.19.1-lora-v1`. It supports
-ordinary LoRA tensors for modeled linear and embedding layers. Compatible
-results require `bias="none"`, `lora_bias=false`, `use_dora=false`, and no
+The first implementation profile is `peft-0.19.1-lora-v1`. Its structural
+inventory models two-dimensional weight-backed and embedding orientations;
+later base reconciliation must prove the actual layer kind. Compatible results
+require `bias="none"`, `lora_bias=false`, `use_dora=false`, and no
 `target_parameters`, layer replication, aLoRA invocation tokens, trainable-token
 indices, Megatron integration, or unmodeled adapter variant.
 
@@ -232,6 +249,12 @@ member, a supported embedding LoRA member, or a tensor governed by an explicit
 and any other unclassified state make the load verdict unknown. A known tensor
 that contradicts the config is incompatible.
 
+The shipped inventory evaluator implements the exact saved-key portion of this
+rule. Empty or unclassified state, retained tensor-record extensions, a mixed
+saved-key pair family, an unmodeled higher-rank weight orientation, a non-closed
+configuration profile, or nonempty `modules_to_save` produces `unknown`.
+`modules_to_save` cannot be inferred safely from a disk key alone.
+
 ### PL110 — LoRA pair completeness
 
 Every supported `lora_A` tensor has exactly one corresponding `lora_B` tensor,
@@ -240,12 +263,32 @@ PEFT conventions. Orphans are incompatible. If distinct raw names collapse to
 the same normalized target or pair, the result is unknown unless the runtime
 profile defines an unambiguous selection.
 
+The shipped evaluator pairs only exact terminal saved-key forms at an exact
+target. It performs no adapter-name, model-prefix, case, or Unicode
+normalization. Under a closed ordinary-LoRA configuration, a recognized orphan
+without extension fields is a contradiction; extensions make that scope
+unknown. Without a closed configuration profile, PL110 is unknown before these
+claims are made.
+
 ### PL111 — LoRA pair dimensions
 
-For a standard linear target, `A` has shape `[rank, input_features]` and `B`
-has shape `[output_features, rank]`. The inner ranks must agree. For embeddings,
-the supported PEFT orientation is checked separately. Unknown orientations do
-not pass through the linear rule.
+The `.lora_A.weight` and `.lora_B.weight` suffixes do not prove a Linear target:
+PEFT 0.19.1 also saves Conv1d, Conv2d, and Conv3d LoRA layers with those forms.
+For a modeled two-dimensional dense candidate, `A` has shape
+`[rank, input_features]` and `B` has shape `[output_features, rank]`. The inner
+ranks must agree. Embedding suffixes prove their separate two-dimensional
+orientation. Unknown orientations do not pass through the dense rule.
+
+The shipped evaluator makes malformed or rank-mismatched two-dimensional pairs
+contradictions. A weight-backed pair with any higher-rank member—including the
+three-, four-, and five-dimensional PEFT convolution cases—is retained as a
+complete syntactic pair but PL111 returns `unknown`; PL102 records the
+unmodeled orientation as a closure dependency. Base topology and layer kind are
+required before a convolution dimension rule can justify a stronger result. In
+the absence of retained tensor-record extension fields, a non-two-dimensional
+embedding pair remains contradictory because its terminal suffix identifies
+the embedding family exactly. Extension-bearing pairs and non-closed
+ordinary-LoRA configurations make PL111 unknown.
 
 ### PL112 — configured rank
 
@@ -254,6 +297,12 @@ insertion-order suffix-regex lookup for `rank_pattern`. The report warns when
 several patterns could match. If source member order was not preserved or the
 matching feature cannot be modeled exactly, the result is unknown. A
 deterministically selected rank mismatch is incompatible.
+
+The shipped bounded evaluator proves only an empty-`rank_pattern` case from a
+valid two-dimensional observed pair. It never compiles or executes retained
+patterns; every nonempty `rank_pattern` returns `unknown`. Higher-rank
+weight-backed candidates and malformed or extension-bearing pairs also return
+`unknown`. Exact PEFT pattern replay remains future work.
 
 ### PL120 — base target existence
 

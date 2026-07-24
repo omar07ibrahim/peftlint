@@ -10,8 +10,9 @@ until a large base model has been loaded.
 
 `peftlint` moves those failures into a bounded preflight step. It currently
 ships pure parsers for PEFT 0.19.1 `adapter_config.json` documents and
-safetensors v0.8 manifests. The broader scanner will reconcile both forms of
-evidence with a pinned base-model manifest before inference or deployment.
+safetensors v0.8 manifests, plus a header-only LoRA tensor inventory and four
+structural rule evaluators. The broader scanner will reconcile that evidence
+with a pinned base-model manifest before inference or deployment.
 
 ## What works today
 
@@ -77,13 +78,47 @@ same object. See
 [Safetensors manifest inspection](https://github.com/omar07ibrahim/peftlint/blob/main/docs/safetensors-parser.md)
 for the staged API, limits, arithmetic, source-adapter contract, and non-goals.
 
+### LoRA inventory evidence
+
+The inventory stage classifies exact PEFT 0.19.1 saved-state keys and evaluates
+PL102, PL110, PL111, and a bounded form of PL112. It works only from validated
+configuration and safetensors manifest values: no tensor payload, model import,
+or user-controlled regular expression is executed. Given already parsed
+`config_manifest` and `weights_manifest` values:
+
+```python
+from peftlint import evaluate_lora_inventory, inspect_lora_inventory
+
+inventory = inspect_lora_inventory(weights_manifest)
+findings = evaluate_lora_inventory(
+    config_manifest,
+    inventory,
+    audit_id=f"audit:sha256:{'0' * 64}",
+    artifact="adapter_model.safetensors@example",
+)
+
+assert {finding.rule_id for finding in findings} == {
+    "PL102",
+    "PL110",
+    "PL111",
+    "PL112",
+}
+```
+
+The exact `.lora_A.weight` and `.lora_B.weight` suffixes identify a
+weight-backed pair, not necessarily a linear layer. Two-dimensional dense
+candidates are modeled; higher-rank Conv1d/2d/3d candidates fail closed as
+`unknown` until their layer orientation can be reconciled with base topology.
+See [Verified LoRA tensor inventory](docs/lora-inventory.md) for the evidence
+grammar, rule outcomes, runnable example, and deliberate limits.
+
 ## First supported slice
 
 The first ruleset is deliberately narrow:
 
 - Hugging Face PEFT LoRA checkpoints interpreted under PEFT 0.19.1;
 - `adapter_config.json` plus `adapter_model.safetensors`;
-- standard linear and embedding targets;
+- modeled two-dimensional weight pairs and embedding targets;
 - immutable base-model revisions;
 - separate verdicts for loading and adapter hotswapping.
 
@@ -94,16 +129,17 @@ Each verdict has three possible states:
 - **unknown** — the artifact needs runtime validation that static evidence
   cannot justify.
 
-The ruleset requires custom model code, unfamiliar tensor naming, fused
-projections, unsupported configuration features, and unclassified tensors to
-produce `unknown`, never a convenient false pass, once the end-to-end evaluator
-is implemented.
+The ruleset requires custom model code, unfamiliar tensor naming, convolution
+orientations, fused projections, unsupported configuration features, and
+unclassified tensors to produce `unknown`, never a convenient false pass.
 
 End-to-end LoRA compatibility evaluation is still under active development.
-The current
+The current inventory evaluators produce rule-level structural evidence, not a
+standalone load verdict: base-target, selection, dtype, vocabulary, and
+remaining mandatory-rule evidence is still absent. The
 [LoRA v1 ruleset](https://github.com/omar07ibrahim/peftlint/blob/main/docs/ruleset-v1.md)
 defines the compatibility boundary and evidence requirements that the remaining
-config, inventory, and base-model stages must satisfy.
+configuration, base-model, and report stages must satisfy.
 
 ## Why static inspection is possible
 

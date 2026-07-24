@@ -82,7 +82,7 @@ class EvidenceField:
 
 @dataclass(frozen=True, slots=True)
 class RuleResult:
-    """A single rule evaluation bound to one immutable audit scope."""
+    """One rule evaluation bound to an immutable audit and evidence scope."""
 
     rule_id: str
     ruleset: str
@@ -193,27 +193,38 @@ def summarize_load(
             )
 
     ordered = tuple(sorted(materialized, key=lambda result: result.sort_key))
-    by_rule: dict[str, RuleResult] = {}
+    by_rule: dict[str, list[RuleResult]] = {}
+    seen_scopes: set[tuple[str, str, str, str]] = set()
     for result in ordered:
-        if result.rule_id in by_rule:
-            raise ValueError(f"duplicate result for load rule {result.rule_id}")
-        by_rule[result.rule_id] = result
+        if result.sort_key in seen_scopes:
+            path = result.logical_path or "<global>"
+            raise ValueError(
+                f"duplicate result for load rule {result.rule_id} "
+                f"at {result.artifact!r} path {path!r}"
+            )
+        seen_scopes.add(result.sort_key)
+        by_rule.setdefault(result.rule_id, []).append(result)
 
     missing = tuple(rule_id for rule_id in required if rule_id not in by_rule)
-    unknown = tuple(
-        rule_id
-        for rule_id in required
-        if rule_id in by_rule and by_rule[rule_id].outcome is RuleOutcome.UNKNOWN
-    )
     contradicting = tuple(
         rule_id
         for rule_id in required
-        if rule_id in by_rule and by_rule[rule_id].outcome is RuleOutcome.CONTRADICTION
+        if rule_id in by_rule
+        and any(result.outcome is RuleOutcome.CONTRADICTION for result in by_rule[rule_id])
+    )
+    contradicting_set = frozenset(contradicting)
+    unknown = tuple(
+        rule_id
+        for rule_id in required
+        if rule_id in by_rule
+        and rule_id not in contradicting_set
+        and any(result.outcome is RuleOutcome.UNKNOWN for result in by_rule[rule_id])
     )
     passing = tuple(
         rule_id
         for rule_id in required
-        if rule_id in by_rule and by_rule[rule_id].outcome is RuleOutcome.PASS
+        if rule_id in by_rule
+        and all(result.outcome is RuleOutcome.PASS for result in by_rule[rule_id])
     )
 
     if contradicting:

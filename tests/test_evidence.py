@@ -110,6 +110,32 @@ def test_different_artifacts_can_contribute_to_the_same_audit() -> None:
     assert summarize(results).verdict is Verdict.COMPATIBLE
 
 
+def test_same_rule_and_path_are_distinct_across_artifacts() -> None:
+    results = all_pass_results()
+    results[0] = replace(
+        results[0],
+        artifact="adapter@sha256:one",
+        logical_path="config.json",
+    )
+    results.append(
+        replace(
+            results[0],
+            artifact="base@sha256:two",
+            message="evaluated the same path in another artifact",
+        )
+    )
+
+    summary = summarize(results)
+
+    assert summary.verdict is Verdict.COMPATIBLE
+    assert tuple(
+        (item.artifact, item.logical_path) for item in summary.results if item.rule_id == "PL001"
+    ) == (
+        ("adapter@sha256:one", "config.json"),
+        ("base@sha256:two", "config.json"),
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -137,6 +163,84 @@ def test_unregistered_summary_ruleset_is_rejected() -> None:
 def test_duplicate_result_is_rejected() -> None:
     results = all_pass_results()
     results.append(results[0])
+
+    with pytest.raises(ValueError, match="duplicate result for load rule PL001"):
+        summarize(results)
+
+
+def test_one_rule_can_report_multiple_path_scoped_findings() -> None:
+    results = all_pass_results()
+    results[8] = replace(results[8], logical_path="model.layers.0.q_proj")
+    results.append(
+        replace(
+            results[8],
+            logical_path="model.layers.1.q_proj",
+            message="evaluated another tensor pair",
+        )
+    )
+
+    summary = summarize(list(reversed(results)))
+
+    assert summary.verdict is Verdict.COMPATIBLE
+    assert tuple(item.logical_path for item in summary.results if item.rule_id == "PL102") == (
+        "model.layers.0.q_proj",
+        "model.layers.1.q_proj",
+    )
+
+
+def test_unknown_path_makes_an_otherwise_passing_rule_unknown() -> None:
+    results = all_pass_results()
+    results[8] = replace(results[8], logical_path="known")
+    results.append(
+        replace(
+            results[8],
+            outcome=RuleOutcome.UNKNOWN,
+            severity=Severity.WARNING,
+            logical_path="unclassified",
+        )
+    )
+
+    summary = summarize(results)
+
+    assert summary.verdict is Verdict.UNKNOWN
+    assert summary.unknown_rules == ("PL102",)
+    assert summary.contradicting_rules == ()
+
+
+def test_contradicting_path_owns_rule_outcome_over_unknown_path() -> None:
+    results = all_pass_results()
+    results[10] = replace(
+        results[10],
+        outcome=RuleOutcome.UNKNOWN,
+        severity=Severity.WARNING,
+        logical_path="unknown",
+    )
+    results.append(
+        replace(
+            results[10],
+            outcome=RuleOutcome.CONTRADICTION,
+            severity=Severity.ERROR,
+            logical_path="mismatched",
+        )
+    )
+
+    summary = summarize(results)
+
+    assert summary.verdict is Verdict.INCOMPATIBLE
+    assert summary.unknown_rules == ()
+    assert summary.contradicting_rules == ("PL111",)
+
+
+def test_duplicate_scope_is_rejected_even_when_finding_differs() -> None:
+    results = all_pass_results()
+    results.append(
+        replace(
+            results[0],
+            outcome=RuleOutcome.UNKNOWN,
+            severity=Severity.WARNING,
+            message="a conflicting evaluation for the same evidence scope",
+        )
+    )
 
     with pytest.raises(ValueError, match="duplicate result for load rule PL001"):
         summarize(results)
